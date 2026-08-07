@@ -8,6 +8,7 @@ import type {
   ParsedUri,
   Recipient,
   SignedTransaction,
+  SubaddressInfo,
   TransactionPriority,
   TransactionsPage,
   WalletBackend,
@@ -152,6 +153,44 @@ export class CppBridge {
   async getWalletStatus(walletId: string): Promise<WalletStatus> {
     const response = await this.module.callMonero('getWalletStatus', [walletId])
     return JSON.parse(response) as WalletStatus
+  }
+
+  /**
+   * Get the receive address at a subaddress index, materializing rows up to
+   * it so the wallet scans for payments to it. Monerod (wallet2) backend
+   * only; the LWS backend does not implement subaddress rows.
+   * @param walletId - Unique identifier for the wallet
+   * @param accountIndex - Subaddress account (major) index
+   * @param addressIndex - Subaddress (minor) index
+   * @returns The address plus the indices it was derived from
+   */
+  async getSubaddress(
+    walletId: string,
+    accountIndex: number,
+    addressIndex: number
+  ): Promise<SubaddressInfo> {
+    const response = await this.module.callMonero('getSubaddress', [
+      walletId,
+      String(accountIndex),
+      String(addressIndex)
+    ])
+    return JSON.parse(response) as SubaddressInfo
+  }
+
+  /**
+   * Next unused receive subaddress for an account: one past the highest
+   * incoming tx minor index on that account, materialized natively.
+   * Opening Receive twice without a payment returns the same address.
+   */
+  async getNextSubaddress(
+    walletId: string,
+    accountIndex: number = 0
+  ): Promise<SubaddressInfo> {
+    const response = await this.module.callMonero('getNextSubaddress', [
+      walletId,
+      String(accountIndex)
+    ])
+    return JSON.parse(response) as SubaddressInfo
   }
 
   /**

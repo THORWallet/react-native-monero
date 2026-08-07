@@ -1,11 +1,11 @@
 {
-  "name": "react-native-monero",
+  "name": "@thorwallet/react-native-monero",
   "version": "0.4.1",
   "description": "React Native bindings for the monero-lwsf library",
-  "homepage": "https://github.com/EdgeApp/react-native-monero",
+  "homepage": "https://github.com/THORWallet/react-native-monero",
   "repository": {
     "type": "git",
-    "url": "git@github.com:EdgeApp/react-native-monero.git"
+    "url": "git@github.com:THORWallet/react-native-monero.git"
   },
   "license": "BSD-3-Clause",
   "author": "Airbitz, Inc.",

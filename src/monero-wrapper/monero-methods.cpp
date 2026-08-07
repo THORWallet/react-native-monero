@@ -667,7 +667,19 @@ static std::string transactionToJson(Monero::Wallet* wallet, Monero::Transaction
   json += "\"description\":\"" + jsonEscape(tx->description()) + "\",";
   json += "\"label\":\"" + jsonEscape(tx->label()) + "\",";
   json += "\"unlockTime\":" + std::to_string(tx->unlockTime()) + ",";
-  json += "\"subaddrAccount\":" + std::to_string(tx->subaddrAccount());
+  json += "\"subaddrAccount\":" + std::to_string(tx->subaddrAccount()) + ",";
+  // Incoming transfers carry a single minor index; outgoing can spend from
+  // several. Expose the full set so callers can pick the right one.
+  json += "\"subaddrIndex\":[";
+  {
+    bool first = true;
+    for (uint32_t idx : tx->subaddrIndex()) {
+      if (!first) json += ",";
+      first = false;
+      json += std::to_string(idx);
+    }
+  }
+  json += "]";
 
   try {
     std::string txKey = wallet->getTxKey(tx->hash());
@@ -1082,6 +1094,89 @@ std::string rejectFetch(const std::vector<std::string> &args) {
   return "ok";
 }
 
+/** Upper bound on subaddress materialization, so a corrupt index cannot
+ *  make the wallet allocate unbounded rows on a single call. */
+static const uint32_t MAX_SUBADDRESS_INDEX = 10000;
+
+/**
+ * Next unused receive subaddress for an account.
+ *
+ * Uses incoming payment minor indices (not the Subaddress row table): the row
+ * table includes lookahead / previously materialized unused addresses, so
+ * max(row)+1 would advance on every Receive open. The focused wallet query
+ * avoids rebuilding the complete transaction history.
+ *
+ * Args: walletId, accountIndex
+ * Returns: JSON with address, accountIndex and addressIndex
+ */
+std::string getNextSubaddress(const std::vector<std::string> &args) {
+  std::string walletId = args[0];
+  uint32_t accountIndex = static_cast<uint32_t>(std::stoul(args[1]));
+
+  Monero::Wallet* wallet = findWalletOrThrow(walletId).wallet;
+
+  uint32_t addressIndex = wallet->nextUnusedSubaddressIndex(accountIndex);
+  if (addressIndex > MAX_SUBADDRESS_INDEX) {
+    throw std::runtime_error("Subaddress index out of range");
+  }
+
+  while (wallet->numSubaddresses(accountIndex) <= addressIndex) {
+    wallet->addSubaddress(accountIndex, "");
+  }
+
+  std::string address = wallet->address(accountIndex, addressIndex);
+  if (address.empty()) {
+    throw std::runtime_error("Failed to derive subaddress");
+  }
+
+  std::string json = "{";
+  json += "\"address\":\"" + jsonEscape(address) + "\",";
+  json += "\"accountIndex\":" + std::to_string(accountIndex) + ",";
+  json += "\"addressIndex\":" + std::to_string(addressIndex);
+  json += "}";
+  return json;
+}
+
+/**
+ * Get the receive address at a subaddress index, creating rows up to it.
+ *
+ * wallet2 only scans for subaddresses it holds a row for: computing the
+ * address is not enough, the index must be materialized via addSubaddress
+ * or payments to it are never detected. numSubaddresses is the row count,
+ * so rows exist for indices [0, numSubaddresses).
+ *
+ * Args: walletId, accountIndex, addressIndex
+ * Returns: JSON with address, accountIndex and addressIndex
+ */
+std::string getSubaddress(const std::vector<std::string> &args) {
+  std::string walletId = args[0];
+  uint32_t accountIndex = static_cast<uint32_t>(std::stoul(args[1]));
+  uint32_t addressIndex = static_cast<uint32_t>(std::stoul(args[2]));
+
+  if (addressIndex > MAX_SUBADDRESS_INDEX) {
+    throw std::runtime_error("Subaddress index out of range");
+  }
+
+  WalletEntry& entry = findWalletOrThrow(walletId);
+  Monero::Wallet* wallet = entry.wallet;
+
+  while (wallet->numSubaddresses(accountIndex) <= addressIndex) {
+    wallet->addSubaddress(accountIndex, "");
+  }
+
+  std::string address = wallet->address(accountIndex, addressIndex);
+  if (address.empty()) {
+    throw std::runtime_error("Failed to derive subaddress");
+  }
+
+  std::string json = "{";
+  json += "\"address\":\"" + jsonEscape(address) + "\",";
+  json += "\"accountIndex\":" + std::to_string(accountIndex) + ",";
+  json += "\"addressIndex\":" + std::to_string(addressIndex);
+  json += "}";
+  return json;
+}
+
 const MoneroMethod moneroMethods[] = {
   { "hello", 0, hello },
   { "generateWallet", 2, generateWallet },
@@ -1102,6 +1197,8 @@ const MoneroMethod moneroMethods[] = {
   { "setNymEnabled", 2, setNymEnabled },
   { "resolveFetch", 3, resolveFetch },
   { "rejectFetch", 2, rejectFetch },
+  { "getSubaddress", 3, getSubaddress },
+  { "getNextSubaddress", 2, getNextSubaddress },
 };
 
 const unsigned moneroMethodCount = std::end(moneroMethods) - std::begin(moneroMethods);

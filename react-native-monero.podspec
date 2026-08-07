@@ -3,7 +3,8 @@ require "json"
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
 Pod::Spec.new do |s|
-  s.name         = package['name']
+  # CocoaPods rejects `/` in pod names, so strip the npm scope.
+  s.name         = package['name'].include?('/') ? package['name'].split('/').last : package['name']
   s.version      = package['version']
   s.summary      = package['description']
   s.homepage     = package['homepage']
@@ -13,7 +14,7 @@ Pod::Spec.new do |s|
   s.platform     = :ios, "13.0"
   s.requires_arc = true
   s.source = {
-    :git => "https://github.com/EdgeApp/react-native-monero.git",
+    :git => "https://github.com/THORWallet/react-native-monero.git",
     :tag => "v#{s.version}"
   }
   s.source_files =

@@ -10,7 +10,7 @@ const moneroHash = '38bc62741b82cca179fb8e3437a388b0e0f67842' // Nov 7, 2025
 
 addTask({
   name: 'monero.clone',
-  cacheTag: moneroHash,
+  cacheTag: `${moneroHash}-next-subaddress-v2`,
   async run(build) {
     await getRepo(
       'monero',
@@ -54,6 +54,101 @@ addTask({
         .replace(
           '#include <IOKit/ps/IOPowerSources.h>',
           '// $& # Disabled by react-native build'
+        ),
+      'utf8'
+    )
+
+    // Add a focused wallet API query for finding the next receive
+    // subaddress. TransactionHistory::refresh rebuilds incoming and outgoing
+    // history objects, which is unnecessarily expensive for this lookup.
+    const walletApiPath = join(
+      build.basePath,
+      'monero/src/wallet/api/wallet2_api.h'
+    )
+    const walletApiHeader = await readFile(walletApiPath, 'utf8')
+    await writeFile(
+      walletApiPath,
+      walletApiHeader.replace(
+        '    virtual size_t numSubaddresses(uint32_t accountIndex) const = 0;',
+        `    virtual size_t numSubaddresses(uint32_t accountIndex) const = 0;
+    virtual uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const = 0;`
+      ),
+      'utf8'
+    )
+
+    const walletHeaderPath = join(
+      build.basePath,
+      'monero/src/wallet/api/wallet.h'
+    )
+    const walletHeader = await readFile(walletHeaderPath, 'utf8')
+    await writeFile(
+      walletHeaderPath,
+      walletHeader.replace(
+        '    size_t numSubaddresses(uint32_t accountIndex) const override;',
+        `    size_t numSubaddresses(uint32_t accountIndex) const override;
+    uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const override;`
+      ),
+      'utf8'
+    )
+
+    const walletCppPath = join(
+      build.basePath,
+      'monero/src/wallet/api/wallet.cpp'
+    )
+    const walletCpp = await readFile(walletCppPath, 'utf8')
+    await writeFile(
+      walletCppPath,
+      walletCpp
+        .replace(
+          '#include <unordered_map>',
+          `#include <limits>
+#include <unordered_map>`
+        )
+        .replace(
+          `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
+{
+    return m_wallet->get_num_subaddresses(accountIndex);
+}`,
+          `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
+{
+    return m_wallet->get_num_subaddresses(accountIndex);
+}
+
+uint32_t WalletImpl::nextUnusedSubaddressIndex(uint32_t accountIndex) const
+{
+    bool found = false;
+    uint32_t max_used = 0;
+
+    std::list<std::pair<crypto::hash, tools::wallet2::payment_details>> payments;
+    m_wallet->get_payments(payments, 0, (uint64_t)-1, accountIndex);
+    for (const auto& payment : payments)
+    {
+        const auto& index = payment.second.m_subaddr_index;
+        if (!found || index.minor > max_used)
+        {
+            found = true;
+            max_used = index.minor;
+        }
+    }
+
+    std::list<std::pair<crypto::hash, tools::wallet2::pool_payment_details>> pool_payments;
+    m_wallet->get_unconfirmed_payments(pool_payments, accountIndex);
+    for (const auto& payment : pool_payments)
+    {
+        const auto& index = payment.second.m_pd.m_subaddr_index;
+        if (!found || index.minor > max_used)
+        {
+            found = true;
+            max_used = index.minor;
+        }
+    }
+
+    if (!found)
+        return 0;
+    if (max_used == std::numeric_limits<uint32_t>::max())
+        throw std::runtime_error("Subaddress index overflow");
+    return max_used + 1;
+}`
         ),
       'utf8'
     )
@@ -295,7 +390,7 @@ export const lwsf = defineLib({
   // Bump this whenever the rpc.cpp / config patch below changes, or the build
   // silently reuses the cached (unpatched) library. The literal tag does not
   // hash the patch content, so edits here are invisible to the cache otherwise.
-  cacheTag: '1-nym-timeout',
+  cacheTag: '1-nym-timeout-next-subaddress-v1',
   libDeps: ['boost', 'libsodium', 'libunbound', 'libzmq', 'openssl'],
   deps: ['monero.clone'],
 
@@ -415,6 +510,76 @@ namespace nymfetch {
       'utf8'
     )
     build.log('Patched rpc.cpp for api_key and nym-fetch support')
+
+    const lwsfWalletHeaderPath = join(build.cwd, 'src/wallet.h')
+    const lwsfWalletHeader = await readFile(lwsfWalletHeaderPath, 'utf8')
+    await writeFile(
+      lwsfWalletHeaderPath,
+      lwsfWalletHeader.replace(
+        '    virtual size_t numSubaddresses(uint32_t accountIndex) const override;',
+        `    virtual size_t numSubaddresses(uint32_t accountIndex) const override;
+    virtual uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const override;`
+      ),
+      'utf8'
+    )
+
+    const lwsfWalletCppPath = join(build.cwd, 'src/wallet.cpp')
+    const lwsfWalletCpp = await readFile(lwsfWalletCppPath, 'utf8')
+    await writeFile(
+      lwsfWalletCppPath,
+      lwsfWalletCpp.replace(
+        `  std::size_t wallet::numSubaddresses(const std::uint32_t accountIndex) const
+  {
+    static_assert(std::numeric_limits<std::uint32_t>::max() <= std::numeric_limits<std::size_t>::max());
+    const boost::lock_guard<boost::mutex> lock{data_->sync};
+    if (accountIndex < data_->primary.subaccounts.size())
+      return std::size_t(data_->primary.subaccounts.at(accountIndex).last) + 1;
+    set_critical(std::runtime_error{"numSubaddresses failed, " + std::to_string(accountIndex) + " does not exist"});
+    return 0;
+  }`,
+        `  std::size_t wallet::numSubaddresses(const std::uint32_t accountIndex) const
+  {
+    static_assert(std::numeric_limits<std::uint32_t>::max() <= std::numeric_limits<std::size_t>::max());
+    const boost::lock_guard<boost::mutex> lock{data_->sync};
+    if (accountIndex < data_->primary.subaccounts.size())
+      return std::size_t(data_->primary.subaccounts.at(accountIndex).last) + 1;
+    set_critical(std::runtime_error{"numSubaddresses failed, " + std::to_string(accountIndex) + " does not exist"});
+    return 0;
+  }
+
+  std::uint32_t wallet::nextUnusedSubaddressIndex(const std::uint32_t accountIndex) const
+  {
+    const boost::lock_guard<boost::mutex> lock{data_->sync};
+    bool found = false;
+    std::uint32_t max_used = 0;
+
+    for (const auto& entry : data_->primary.txes)
+    {
+      const auto& tx = *entry.second;
+      if (tx.direction != Monero::TransactionInfo::Direction_In)
+        continue;
+
+      for (const auto& receive : tx.receives)
+      {
+        const auto& recipient = receive.second.recipient;
+        if (recipient.maj_i == accountIndex &&
+            (!found || recipient.min_i > max_used))
+        {
+          found = true;
+          max_used = recipient.min_i;
+        }
+      }
+    }
+
+    if (!found)
+      return 0;
+    if (max_used == std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error{"Subaddress index overflow"};
+    return max_used + 1;
+  }`
+      ),
+      'utf8'
+    )
 
     build.exportEnv({
       PKG_CONFIG_PATH: join(prefixPath, '/lib/pkgconfig')

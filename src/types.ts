@@ -27,6 +27,13 @@ export interface DerivedKeys {
   publicSpendKey: string
 }
 
+/** Return type for getSubaddress / getNextSubaddress. */
+export interface SubaddressInfo {
+  address: string
+  accountIndex: number
+  addressIndex: number
+}
+
 /** Return type for openWallet and getWalletStatus. */
 export interface WalletStatus {
   syncedHeight: number
@@ -63,6 +70,11 @@ export interface TransactionInfo {
   label: string
   unlockTime: number
   subaddrAccount: number
+  /**
+   * Minor subaddress indices involved in this tx. Incoming transfers always
+   * have exactly one; outgoing transfers may spend from several.
+   */
+  subaddrIndex: number[]
   txKey?: string // Only available for outgoing transactions we sent
 }
 

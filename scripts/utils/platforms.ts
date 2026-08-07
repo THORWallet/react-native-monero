@@ -134,6 +134,16 @@ export async function makeAndroidPlatforms(
         `-DCMAKE_ANDROID_ARCH_ABI=${arch}`,
         `-DCMAKE_ANDROID_NDK=${ndkPath}`,
         `-DCMAKE_ANDROID_STL_TYPE=c++_shared`,
+        // Force NDK archivers. Without these, CMake picks the host
+        // /usr/bin/ar, which silently drops ELF members on modern macOS
+        // ("not a mach-o file") and leaves empty 96-byte .a stubs that
+        // then fail the ffi link with undefined monero/lwsf symbols.
+        `-DCMAKE_AR=${sysroot}/bin/llvm-ar`,
+        `-DCMAKE_RANLIB=${sysroot}/bin/llvm-ranlib`,
+        `-DCMAKE_CXX_COMPILER_AR=${sysroot}/bin/llvm-ar`,
+        `-DCMAKE_CXX_COMPILER_RANLIB=${sysroot}/bin/llvm-ranlib`,
+        `-DCMAKE_C_COMPILER_AR=${sysroot}/bin/llvm-ar`,
+        `-DCMAKE_C_COMPILER_RANLIB=${sysroot}/bin/llvm-ranlib`,
         `-DCMAKE_SYSTEM_NAME=Android`,
         `-DCMAKE_SYSTEM_VERSION=${api}`
       ],

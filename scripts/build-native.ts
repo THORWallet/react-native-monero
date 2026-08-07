@@ -18,7 +18,7 @@
 // | OpenSSL    | custom            | custom                |
 //
 
-import { mkdir, rm } from 'fs/promises'
+import { mkdir, rm, writeFile } from 'fs/promises'
 import { basename, join } from 'path'
 
 import { boost } from './libraries/boost'
@@ -123,16 +123,33 @@ const ffi = defineLib({
         ...objects
       ])
 
-      // Localize all symbols except the ones we really want,
-      // hiding them from future linking steps:
-      await build.exec(platform.tools.OBJCOPY, [
-        objectPath,
-        '-w',
-        '-L*',
-        '-L!_moneroMethods',
-        '-L!_moneroMethodCount',
-        '-L!*moneroSetEventCallback*'
-      ])
+      // Localize all symbols except the ones we really want, hiding them
+      // from future linking steps. llvm-objcopy's -w/-L wildcard localize
+      // is not supported for Mach-O (Homebrew LLVM 19+ errors with
+      // "option is not supported for MachO"), so use Apple's nmedit.
+      const nmOut = await build.exec('nm', ['-g', objectPath], {
+        capture: true
+      })
+      const keepSymbols = nmOut
+        .split('\n')
+        .map(line => {
+          const parts = line.trim().split(/\s+/)
+          return parts[parts.length - 1] ?? ''
+        })
+        .filter(
+          sym =>
+            sym === '_moneroMethods' ||
+            sym === '_moneroMethodCount' ||
+            sym.includes('moneroSetEventCallback')
+        )
+      if (keepSymbols.length === 0) {
+        throw new Error(
+          'nmedit keep-list empty: expected moneroMethods / moneroMethodCount / moneroSetEventCallback'
+        )
+      }
+      const keepSymbolsPath = join(build.cwd, 'keep-symbols.txt')
+      await writeFile(keepSymbolsPath, keepSymbols.join('\n') + '\n')
+      await build.exec('nmedit', ['-s', keepSymbolsPath, objectPath])
 
       // Generate a static library:
       const library = join(build.cwd, `monero-module.a`)
