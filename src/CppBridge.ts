@@ -1,9 +1,11 @@
 'use strict'
 
 import type {
+  AccountStatus,
   DerivedKeys,
   EncodeUriParams,
   GeneratedWallet,
+  MoneroAccountSummary,
   NetworkType,
   ParsedUri,
   Recipient,
@@ -191,6 +193,56 @@ export class CppBridge {
       String(accountIndex)
     ])
     return JSON.parse(response) as SubaddressInfo
+  }
+
+  /** Get summaries for all subaddress accounts in an open wallet. */
+  async getAccounts(walletId: string): Promise<MoneroAccountSummary[]> {
+    const response = await this.module.callMonero('getAccounts', [walletId])
+    return JSON.parse(response) as MoneroAccountSummary[]
+  }
+
+  /** Create a subaddress account and return its index. */
+  async createAccount(
+    walletId: string,
+    label: string
+  ): Promise<{ index: number }> {
+    const response = await this.module.callMonero('createAccount', [
+      walletId,
+      label
+    ])
+    return JSON.parse(response) as { index: number }
+  }
+
+  /** Get wallet status scoped to one subaddress account. */
+  async getAccountStatus(
+    walletId: string,
+    accountIndex: number
+  ): Promise<AccountStatus> {
+    const response = await this.module.callMonero('getAccountStatus', [
+      walletId,
+      String(accountIndex)
+    ])
+    return JSON.parse(response) as AccountStatus
+  }
+
+  /** Create and retain a transaction spending from one subaddress account. */
+  async createTransactionFromAccount(
+    walletId: string,
+    recipients: Recipient[],
+    priority: TransactionPriority,
+    accountIndex: number
+  ): Promise<SignedTransaction> {
+    const response = await this.module.callMonero(
+      'createTransactionFromAccount',
+      [
+        walletId,
+        recipients.map(r => r.address).join(','),
+        recipients.map(r => r.amount).join(','),
+        String(priority),
+        String(accountIndex)
+      ]
+    )
+    return JSON.parse(response) as SignedTransaction
   }
 
   /**

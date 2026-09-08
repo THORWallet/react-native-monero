@@ -34,6 +34,14 @@ export interface SubaddressInfo {
   addressIndex: number
 }
 
+/** Summary of a subaddress account. */
+export interface MoneroAccountSummary {
+  index: number
+  label: string
+  balance: string
+  unlockedBalance: string
+}
+
 /** Return type for openWallet and getWalletStatus. */
 export interface WalletStatus {
   syncedHeight: number
@@ -48,6 +56,11 @@ export interface WalletStatus {
    * is true.
    */
   refreshed: boolean
+}
+
+/** Wallet status scoped to one subaddress account. */
+export interface AccountStatus extends WalletStatus {
+  otherAccountsBalance: string
 }
 
 /** Transaction direction. */

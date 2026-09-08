@@ -1137,6 +1137,99 @@ std::string getNextSubaddress(const std::vector<std::string> &args) {
   return json;
 }
 
+/** Args: walletId. Returns: [{index,label,balance,unlockedBalance}] */
+std::string getAccounts(const std::vector<std::string> &args) {
+  Monero::Wallet* wallet = findWalletOrThrow(args[0]).wallet;
+  uint32_t count = wallet->numSubaddressAccounts();
+  std::string json = "[";
+  for (uint32_t i = 0; i < count; ++i) {
+    if (i > 0) json += ",";
+    json += "{\"index\":" + std::to_string(i) +
+            ",\"label\":\"" + jsonEscape(wallet->getSubaddressLabel(i, 0)) +
+            "\",\"balance\":\"" + std::to_string(wallet->balance(i)) +
+            "\",\"unlockedBalance\":\"" + std::to_string(wallet->unlockedBalance(i)) + "\"}";
+  }
+  return json + "]";
+}
+
+/** Args: walletId, label. Returns: {index} */
+std::string createAccount(const std::vector<std::string> &args) {
+  Monero::Wallet* wallet = findWalletOrThrow(args[0]).wallet;
+  wallet->addSubaddressAccount(args[1]);
+  wallet->store("");
+  return "{\"index\":" + std::to_string(wallet->numSubaddressAccounts() - 1) + "}";
+}
+
+/** Args: walletId, accountIndex. WalletStatus shape plus otherAccountsBalance. */
+std::string getAccountStatus(const std::vector<std::string> &args) {
+  WalletEntry& entry = findWalletOrThrow(args[0]);
+  Monero::Wallet* wallet = entry.wallet;
+  uint32_t accountIndex = static_cast<uint32_t>(std::stoul(args[1]));
+  if (accountIndex >= wallet->numSubaddressAccounts()) {
+    throw std::runtime_error("Account index out of range");
+  }
+  uint64_t balance = wallet->balance(accountIndex);
+  uint64_t unlocked = wallet->unlockedBalance(accountIndex);
+  uint64_t all = wallet->balanceAll();
+  bool refreshed = entry.listener != nullptr && entry.listener->hasRefreshed();
+  std::string json = "{";
+  json += "\"syncedHeight\":" + std::to_string(wallet->blockChainHeight()) + ",";
+  json += "\"networkHeight\":" + std::to_string(wallet->daemonBlockChainHeight()) + ",";
+  json += "\"balance\":\"" + std::to_string(balance) + "\",";
+  json += "\"unlockedBalance\":\"" + std::to_string(unlocked) + "\",";
+  json += "\"otherAccountsBalance\":\"" + std::to_string(all > balance ? all - balance : 0) + "\",";
+  json += "\"refreshed\":" + std::string(refreshed ? "true" : "false");
+  return json + "}";
+}
+
+/**
+ * Create a transaction from a specific subaddress account.
+ * Args: walletId, addresses, amounts, priority, accountIndex
+ * Returns: JSON with txid, signedTxHex, and fee
+ */
+std::string createTransactionFromAccount(const std::vector<std::string> &args) {
+  WalletEntry& entry = findWalletOrThrow(args[0]);
+  Monero::Wallet* wallet = entry.wallet;
+  std::vector<std::string> addresses = splitString(args[1], ',');
+  std::vector<std::string> amountStrs = splitString(args[2], ',');
+  int priority = std::stoi(args[3]);
+  uint32_t accountIndex = static_cast<uint32_t>(std::stoul(args[4]));
+  if (accountIndex >= wallet->numSubaddressAccounts()) {
+    throw std::runtime_error("Account index out of range");
+  }
+  if (addresses.empty() || addresses.size() != amountStrs.size()) {
+    throw std::runtime_error("Addresses and amounts must have same length and not be empty");
+  }
+  std::vector<uint64_t> amounts;
+  for (const auto& amt : amountStrs) amounts.push_back(std::stoull(amt));
+  Monero::optional<std::vector<uint64_t>> optAmounts;
+  if (addresses.size() == 1 && amounts[0] == 0) optAmounts = std::nullopt;
+  else optAmounts = amounts;
+
+  wallet->pauseRefresh();
+  Monero::PendingTransaction* ptx = wallet->createTransactionMultDest(
+    addresses, "", optAmounts, 0,
+    static_cast<Monero::PendingTransaction::Priority>(priority), accountIndex);
+  wallet->startRefresh();
+
+  if (ptx == nullptr) throw std::runtime_error("Failed to create transaction");
+  if (ptx->status() != Monero::PendingTransaction::Status_Ok) {
+    std::string error = ptx->errorString();
+    wallet->disposeTransaction(ptx);
+    throw std::runtime_error("Transaction error: " + error);
+  }
+  std::vector<std::string> txIds = ptx->txid();
+  if (txIds.size() != 1) {
+    std::string count = std::to_string(txIds.size());
+    wallet->disposeTransaction(ptx);
+    throw std::runtime_error("Transaction would split into " + count + " transactions; send a smaller amount");
+  }
+  std::string txHash = txIds[0];
+  uint64_t fee = ptx->fee();
+  retainTx(args[0], wallet, txHash, ptx);
+  return "{\"txid\":\"" + txHash + "\",\"signedTxHex\":\"" + txHash + "\",\"fee\":\"" + std::to_string(fee) + "\"}";
+}
+
 /**
  * Get the receive address at a subaddress index, creating rows up to it.
  *
@@ -1199,6 +1292,10 @@ const MoneroMethod moneroMethods[] = {
   { "rejectFetch", 2, rejectFetch },
   { "getSubaddress", 3, getSubaddress },
   { "getNextSubaddress", 2, getNextSubaddress },
+  { "getAccounts", 1, getAccounts },
+  { "createAccount", 2, createAccount },
+  { "getAccountStatus", 2, getAccountStatus },
+  { "createTransactionFromAccount", 5, createTransactionFromAccount },
 };
 
 const unsigned moneroMethodCount = std::end(moneroMethods) - std::begin(moneroMethods);
