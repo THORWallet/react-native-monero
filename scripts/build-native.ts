@@ -238,6 +238,7 @@ addTask({
   deps: [
     'ffi.build.android-arm64-v8a',
     'ffi.build.android-armeabi-v7a',
+    'ffi.build.android-x86_64',
     'xcframework'
   ],
   async run() {}
