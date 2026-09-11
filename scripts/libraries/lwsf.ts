@@ -10,7 +10,7 @@ const moneroHash = '38bc62741b82cca179fb8e3437a388b0e0f67842' // Nov 7, 2025
 
 addTask({
   name: 'monero.clone',
-  cacheTag: `${moneroHash}-next-subaddress-v2`,
+  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v1`,
   async run(build) {
     await getRepo(
       'monero',
@@ -58,6 +58,84 @@ addTask({
       'utf8'
     )
 
+    // Extend epee SSL options with an observation callback for explicit TOFU
+    // discovery, and allow an explicit CA file while retaining system_ca's
+    // hostname verification.
+    const netSslHeaderPath = join(
+      build.basePath,
+      'monero/contrib/epee/include/net/net_ssl.h'
+    )
+    const netSslHeader = await readFile(netSslHeaderPath, 'utf8')
+    const patchedNetSslHeader = netSslHeader
+      .replace(
+        '#include <chrono>',
+        `#include <chrono>
+#include <functional>`
+      )
+      .replace(
+        '    ssl_verification_t verification;',
+        `    ssl_verification_t verification;
+    std::function<void(const std::string&)> peer_fingerprint_callback;`
+      )
+    if (!patchedNetSslHeader.includes('peer_fingerprint_callback')) {
+      throw new Error('Monero net_ssl.h observer patch anchor did not match')
+    }
+    await writeFile(netSslHeaderPath, patchedNetSslHeader, 'utf8')
+
+    const netSslCppPath = join(
+      build.basePath,
+      'monero/contrib/epee/src/net_ssl.cpp'
+    )
+    const netSslCpp = await readFile(netSslCppPath, 'utf8')
+    const patchedNetSslCpp = netSslCpp
+      .replace(
+        `#else
+      ssl_context.set_default_verify_paths();
+#endif`,
+        `#else
+      if (ca_path.empty())
+        ssl_context.set_default_verify_paths();
+      else
+      {
+        const boost::system::error_code err = load_ca_file(ssl_context, ca_path);
+        if (err)
+          throw boost::system::system_error{err, "Failed to load CA file at " + ca_path};
+      }
+#endif`
+      )
+      .replace(
+        `  MDEBUG("SSL handshake success");
+  return true;`,
+        `  if (peer_fingerprint_callback)
+  {
+    X509* cert = SSL_get1_peer_certificate(socket.native_handle());
+    if (!cert)
+    {
+      MERROR("TLS peer did not provide a certificate");
+      return false;
+    }
+    try
+    {
+      peer_fingerprint_callback(get_hr_ssl_fingerprint(cert));
+    }
+    catch (...)
+    {
+      X509_free(cert);
+      throw;
+    }
+    X509_free(cert);
+  }
+  MDEBUG("SSL handshake success");
+  return true;`
+      )
+    if (
+      !patchedNetSslCpp.includes('SSL_get1_peer_certificate') ||
+      !patchedNetSslCpp.includes('Failed to load CA file at')
+    ) {
+      throw new Error('Monero net_ssl.cpp TLS patch anchor did not match')
+    }
+    await writeFile(netSslCppPath, patchedNetSslCpp, 'utf8')
+
     // Add a focused wallet API query for finding the next receive
     // subaddress. TransactionHistory::refresh rebuilds incoming and outgoing
     // history objects, which is unnecessarily expensive for this lookup.
@@ -66,50 +144,116 @@ addTask({
       'monero/src/wallet/api/wallet2_api.h'
     )
     const walletApiHeader = await readFile(walletApiPath, 'utf8')
-    await writeFile(
-      walletApiPath,
-      walletApiHeader.replace(
+    const patchedWalletApiHeader = walletApiHeader
+      .replace(
+        '#include <vector>',
+        `#include <vector>
+#include "net/net_ssl.h"`
+      )
+      .replace(
+        '    virtual bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") = 0;',
+        `    virtual bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") = 0;
+    virtual bool initWithTls(const std::string &daemon_address, uint64_t upper_transaction_size_limit, const std::string &daemon_username, const std::string &daemon_password, bool lightWallet, const std::string &proxy_address, epee::net_utils::ssl_options_t ssl_options) = 0;`
+      )
+      .replace(
+        '    virtual void setDaemonAddress(const std::string &address) = 0;',
+        `    virtual void setDaemonAddress(const std::string &address) = 0;
+    virtual void setDaemonAddressWithTls(const std::string &address, epee::net_utils::ssl_options_t ssl_options, const std::string &proxy_address) = 0;`
+      )
+      .replace(
         '    virtual size_t numSubaddresses(uint32_t accountIndex) const = 0;',
         `    virtual size_t numSubaddresses(uint32_t accountIndex) const = 0;
     virtual uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const = 0;`
-      ),
-      'utf8'
-    )
+      )
+    if (
+      !patchedWalletApiHeader.includes('virtual bool initWithTls') ||
+      !patchedWalletApiHeader.includes('setDaemonAddressWithTls')
+    ) {
+      throw new Error('Monero wallet2_api.h TLS patch anchor did not match')
+    }
+    await writeFile(walletApiPath, patchedWalletApiHeader, 'utf8')
 
     const walletHeaderPath = join(
       build.basePath,
       'monero/src/wallet/api/wallet.h'
     )
     const walletHeader = await readFile(walletHeaderPath, 'utf8')
-    await writeFile(
-      walletHeaderPath,
-      walletHeader.replace(
+    const patchedWalletHeader = walletHeader
+      .replace(
+        '    bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") override;',
+        `    bool init(const std::string &daemon_address, uint64_t upper_transaction_size_limit = 0, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") override;
+    bool initWithTls(const std::string &daemon_address, uint64_t upper_transaction_size_limit, const std::string &daemon_username, const std::string &daemon_password, bool lightWallet, const std::string &proxy_address, epee::net_utils::ssl_options_t ssl_options) override;`
+      )
+      .replace(
+        '    bool doInit(const std::string &daemon_address, const std::string &proxy_address, uint64_t upper_transaction_size_limit = 0, bool ssl = false);',
+        '    bool doInit(const std::string &daemon_address, const std::string &proxy_address, uint64_t upper_transaction_size_limit, epee::net_utils::ssl_options_t ssl_options);'
+      )
+      .replace(
         '    size_t numSubaddresses(uint32_t accountIndex) const override;',
         `    size_t numSubaddresses(uint32_t accountIndex) const override;
     uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const override;`
-      ),
-      'utf8'
-    )
+      )
+    if (!patchedWalletHeader.includes('bool initWithTls')) {
+      throw new Error('Monero wallet.h TLS patch anchor did not match')
+    }
+    await writeFile(walletHeaderPath, patchedWalletHeader, 'utf8')
 
     const walletCppPath = join(
       build.basePath,
       'monero/src/wallet/api/wallet.cpp'
     )
     const walletCpp = await readFile(walletCppPath, 'utf8')
-    await writeFile(
-      walletCppPath,
-      walletCpp
-        .replace(
-          '#include <unordered_map>',
-          `#include <limits>
+    const patchedWalletCpp = walletCpp
+      .replace(
+        '#include <unordered_map>',
+        `#include <limits>
 #include <unordered_map>`
-        )
-        .replace(
-          `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
+      )
+      .replace(
+        `bool WalletImpl::init(const std::string &daemon_address, uint64_t upper_transaction_size_limit, const std::string &daemon_username, const std::string &daemon_password, bool use_ssl, bool lightWallet, const std::string &proxy_address)
+{
+    clearStatus();
+    if(daemon_username != "")
+        m_daemon_login.emplace(daemon_username, daemon_password);
+    return doInit(daemon_address, proxy_address, upper_transaction_size_limit, use_ssl);
+}`,
+        `bool WalletImpl::init(const std::string &daemon_address, uint64_t upper_transaction_size_limit, const std::string &daemon_username, const std::string &daemon_password, bool use_ssl, bool lightWallet, const std::string &proxy_address)
+{
+    epee::net_utils::ssl_options_t ssl_options{
+        use_ssl
+            ? epee::net_utils::ssl_support_t::e_ssl_support_enabled
+            : epee::net_utils::ssl_support_t::e_ssl_support_autodetect};
+    return initWithTls(daemon_address, upper_transaction_size_limit,
+                       daemon_username, daemon_password, lightWallet,
+                       proxy_address, std::move(ssl_options));
+}
+
+bool WalletImpl::initWithTls(const std::string &daemon_address, uint64_t upper_transaction_size_limit, const std::string &daemon_username, const std::string &daemon_password, bool, const std::string &proxy_address, epee::net_utils::ssl_options_t ssl_options)
+{
+    clearStatus();
+    if(daemon_username != "")
+        m_daemon_login.emplace(daemon_username, daemon_password);
+    return doInit(daemon_address, proxy_address, upper_transaction_size_limit,
+                  std::move(ssl_options));
+}`
+      )
+      .replace(
+        'bool WalletImpl::doInit(const string &daemon_address, const std::string &proxy_address, uint64_t upper_transaction_size_limit, bool ssl)',
+        'bool WalletImpl::doInit(const string &daemon_address, const std::string &proxy_address, uint64_t upper_transaction_size_limit, epee::net_utils::ssl_options_t ssl_options)'
+      )
+      .replace(
+        '    if (!m_wallet->init(daemon_address, m_daemon_login, proxy_address, upper_transaction_size_limit))',
+        `    // Preserve the caller's exact per-node TLS verification policy.
+    if (!m_wallet->init(daemon_address, m_daemon_login, proxy_address,
+                        upper_transaction_size_limit, true,
+                        std::move(ssl_options)))`
+      )
+      .replace(
+        `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
 {
     return m_wallet->get_num_subaddresses(accountIndex);
 }`,
-          `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
+        `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
 {
     return m_wallet->get_num_subaddresses(accountIndex);
 }
@@ -149,9 +293,79 @@ uint32_t WalletImpl::nextUnusedSubaddressIndex(uint32_t accountIndex) const
         throw std::runtime_error("Subaddress index overflow");
     return max_used + 1;
 }`
-        ),
-      'utf8'
+      )
+    if (
+      !patchedWalletCpp.includes('bool WalletImpl::initWithTls') ||
+      !patchedWalletCpp.includes('std::move(ssl_options)')
+    ) {
+      throw new Error(
+        'Monero wallet.cpp TLS patch anchor did not match the pinned source'
+      )
+    }
+    await writeFile(walletCppPath, patchedWalletCpp, 'utf8')
+
+    const walletManagerHeaderPath = join(
+      build.basePath,
+      'monero/src/wallet/api/wallet_manager.h'
     )
+    const walletManagerHeader = await readFile(walletManagerHeaderPath, 'utf8')
+    const patchedWalletManagerHeader = walletManagerHeader.replace(
+      '    void setDaemonAddress(const std::string &address) override;',
+      `    void setDaemonAddress(const std::string &address) override;
+    void setDaemonAddressWithTls(const std::string &address, epee::net_utils::ssl_options_t ssl_options, const std::string &proxy_address) override;`
+    )
+    if (!patchedWalletManagerHeader.includes('setDaemonAddressWithTls')) {
+      throw new Error('Monero wallet_manager.h TLS patch anchor did not match')
+    }
+    await writeFile(walletManagerHeaderPath, patchedWalletManagerHeader, 'utf8')
+
+    // WalletManager powers the standalone network-height probe. It has a
+    // separate HTTP client from wallet2, so propagate the same exact policy.
+    const walletManagerCppPath = join(
+      build.basePath,
+      'monero/src/wallet/api/wallet_manager.cpp'
+    )
+    const walletManagerCpp = await readFile(walletManagerCppPath, 'utf8')
+    const patchedWalletManagerCpp = walletManagerCpp
+      .replace(
+        '#include "version.h"',
+        `#include "version.h"
+#include "net/parse.h"
+#include "net/socks_connect.h"`
+      )
+      .replace(
+        `void WalletManagerImpl::setDaemonAddress(const std::string &address)
+{
+    m_http_client.set_server(address, boost::none);
+}`,
+        `void WalletManagerImpl::setDaemonAddress(const std::string &address)
+{
+    m_http_client.set_server(address, boost::none);
+}
+
+void WalletManagerImpl::setDaemonAddressWithTls(
+    const std::string &address,
+    epee::net_utils::ssl_options_t ssl_options,
+    const std::string &proxy_address)
+{
+    if (proxy_address.empty())
+        m_http_client.set_connector(epee::net_utils::direct_connect{});
+    else
+    {
+        auto endpoint = net::get_tcp_endpoint(proxy_address);
+        if (!endpoint)
+            throw std::runtime_error("Invalid SOCKS proxy address");
+        m_http_client.set_connector(net::socks::connector{std::move(*endpoint)});
+    }
+    m_http_client.set_server(address, boost::none, std::move(ssl_options));
+}`
+      )
+    if (!patchedWalletManagerCpp.includes('setDaemonAddressWithTls')) {
+      throw new Error(
+        'Monero wallet_manager.cpp TLS patch anchor did not match the pinned source'
+      )
+    }
+    await writeFile(walletManagerCppPath, patchedWalletManagerCpp, 'utf8')
 
     // Patch monero/src/net/http.cpp so that `client_factory::create()`
     // returns a nym-aware http client when the nym-fetch interceptor is
@@ -262,16 +476,9 @@ private:
     // Monerod wallet2 calls carry their target through set_server(), so
     // use that per-client state instead of the global LWSF base URL.
     if (m_host.empty()) return false;
-    // wallet2 re-issues set_server() with autodetect SSL during sync, so
-    // m_use_https is unreliable and would emit http:// on port 443, breaking
-    // every monerod RPC under Nym (sync, fee/output queries, broadcast). The
-    // non-Nym epee client keeps the scheme from the daemon address, which is
-    // why monerod works with Nym off but not on. Treat the standard HTTPS port
-    // as https. Known gap: an https daemon on a non-standard port still gets
-    // http:// URLs under Nym. Nothing upstream seeds m_use_https for wallet2
-    // (WalletImpl::doInit drops the API-level use_ssl flag, and openWallet
-    // deliberately passes use_ssl=false for lwsf's TLS behavior; see the
-    // comment in monero-methods.cpp openWallet).
+    // The native wrapper now seeds enabled TLS for https:// daemon addresses.
+    // Keep the port fallback for compatibility with wallets created by older
+    // callers that did not propagate the scheme into ssl_options.
     const bool use_https = m_use_https || m_port == "443";
     std::string base = (use_https ? "https://" : "http://") + m_host;
     if (!m_port.empty()) base += ":" + m_port;
@@ -390,7 +597,7 @@ export const lwsf = defineLib({
   // Bump this whenever the rpc.cpp / config patch below changes, or the build
   // silently reuses the cached (unpatched) library. The literal tag does not
   // hash the patch content, so edits here are invisible to the cache otherwise.
-  cacheTag: '1-nym-timeout-next-subaddress-v1',
+  cacheTag: '3-nym-timeout-next-subaddress-tls-policy-v2',
   libDeps: ['boost', 'libsodium', 'libunbound', 'libzmq', 'openssl'],
   deps: ['monero.clone'],
 
@@ -513,21 +720,112 @@ namespace nymfetch {
 
     const lwsfWalletHeaderPath = join(build.cwd, 'src/wallet.h')
     const lwsfWalletHeader = await readFile(lwsfWalletHeaderPath, 'utf8')
-    await writeFile(
-      lwsfWalletHeaderPath,
-      lwsfWalletHeader.replace(
+    const patchedLwsfWalletHeader = lwsfWalletHeader
+      .replace(
+        '    virtual bool init(const std::string &daemon_address, uint64_t, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") override;',
+        `    virtual bool init(const std::string &daemon_address, uint64_t, const std::string &daemon_username = "", const std::string &daemon_password = "", bool use_ssl = false, bool lightWallet = false, const std::string &proxy_address = "") override;
+    virtual bool initWithTls(const std::string &daemon_address, uint64_t, const std::string &daemon_username, const std::string &daemon_password, bool lightWallet, const std::string &proxy_address, epee::net_utils::ssl_options_t ssl_options) override;`
+      )
+      .replace(
         '    virtual size_t numSubaddresses(uint32_t accountIndex) const override;',
         `    virtual size_t numSubaddresses(uint32_t accountIndex) const override;
     virtual uint32_t nextUnusedSubaddressIndex(uint32_t accountIndex) const override;`
-      ),
-      'utf8'
-    )
+      )
+    if (!patchedLwsfWalletHeader.includes('initWithTls')) {
+      throw new Error('lwsf wallet.h TLS patch anchor did not match')
+    }
+    await writeFile(lwsfWalletHeaderPath, patchedLwsfWalletHeader, 'utf8')
 
     const lwsfWalletCppPath = join(build.cwd, 'src/wallet.cpp')
     const lwsfWalletCpp = await readFile(lwsfWalletCppPath, 'utf8')
-    await writeFile(
-      lwsfWalletCppPath,
-      lwsfWalletCpp.replace(
+    const patchedLwsfWalletCpp = lwsfWalletCpp
+      .replace(
+        `  bool wallet::init(const std::string &daemon_address, uint64_t, const std::string &daemon_username, const std::string &daemon_password, bool use_ssl, bool light_wallet, const std::string &proxy_address)
+  {
+    if (!light_wallet)
+      throw std::invalid_argument{"Only light_wallets are supported with this instance"};
+
+    try
+    {
+      epee::net_utils::http::url_content url{};
+      if (!epee::net_utils::parse_url(daemon_address, url))
+        throw std::runtime_error{"Invalid LWS URL: " + daemon_address};
+      if (!url.m_uri_content.m_path.empty())
+        throw std::runtime_error{"LWS URL contains path (unsupported)"};
+
+      if (!proxy_address.empty() && !setProxy(proxy_address))
+        return false;
+
+      boost::optional<epee::net_utils::http::login> login;
+      if (!daemon_username.empty() || !daemon_password.empty())
+        login.emplace(daemon_username, daemon_password);
+
+      // verify cert if \`use_ssl == true\`, otherwise autodetect if \`https\`
+      // specified.
+      const bool https = url.schema == "https";
+      epee::net_utils::ssl_options_t options{
+        !use_ssl ?
+          (https ? epee::net_utils::ssl_support_t::e_ssl_support_autodetect : epee::net_utils::ssl_support_t::e_ssl_support_disabled) :
+            epee::net_utils::ssl_support_t::e_ssl_support_enabled
+      };
+
+      if (!url.port)
+      {
+        if ((use_ssl || https))
+          url.port = 443;
+        else
+          url.port = 80;
+      }
+      data_->client.set_server(std::move(url.host), std::to_string(url.port), std::move(login), std::move(options));
+    }
+    catch (const std::exception& e)
+    {
+      set_critical(e);
+      return false;
+    }
+
+    return true;
+  }`,
+        `  bool wallet::init(const std::string &daemon_address, uint64_t limit, const std::string &daemon_username, const std::string &daemon_password, bool use_ssl, bool light_wallet, const std::string &proxy_address)
+  {
+    epee::net_utils::ssl_options_t options{
+      use_ssl ? epee::net_utils::ssl_support_t::e_ssl_support_enabled :
+                epee::net_utils::ssl_support_t::e_ssl_support_autodetect
+    };
+    return initWithTls(daemon_address, limit, daemon_username, daemon_password,
+                       light_wallet, proxy_address, std::move(options));
+  }
+
+  bool wallet::initWithTls(const std::string &daemon_address, uint64_t, const std::string &daemon_username, const std::string &daemon_password, bool light_wallet, const std::string &proxy_address, epee::net_utils::ssl_options_t options)
+  {
+    if (!light_wallet)
+      throw std::invalid_argument{"Only light_wallets are supported with this instance"};
+    try
+    {
+      epee::net_utils::http::url_content url{};
+      if (!epee::net_utils::parse_url(daemon_address, url))
+        throw std::runtime_error{"Invalid LWS URL: " + daemon_address};
+      if (!url.m_uri_content.m_path.empty())
+        throw std::runtime_error{"LWS URL contains path (unsupported)"};
+      if (!proxy_address.empty() && !setProxy(proxy_address))
+        return false;
+      boost::optional<epee::net_utils::http::login> login;
+      if (!daemon_username.empty() || !daemon_password.empty())
+        login.emplace(daemon_username, daemon_password);
+      if (!url.port)
+        url.port = options.support == epee::net_utils::ssl_support_t::e_ssl_support_disabled ? 80 : 443;
+      data_->client.set_server(std::move(url.host), std::to_string(url.port),
+                               std::move(login), std::move(options));
+    }
+    catch (const std::exception& e)
+    {
+      set_critical(e);
+      return false;
+    }
+    return true;
+  }`
+      )
+      .replace(
         `  std::size_t wallet::numSubaddresses(const std::uint32_t accountIndex) const
   {
     static_assert(std::numeric_limits<std::uint32_t>::max() <= std::numeric_limits<std::size_t>::max());
@@ -577,9 +875,60 @@ namespace nymfetch {
       throw std::runtime_error{"Subaddress index overflow"};
     return max_used + 1;
   }`
-      ),
-      'utf8'
-    )
+      )
+    if (!patchedLwsfWalletCpp.includes('wallet::initWithTls')) {
+      throw new Error('lwsf wallet.cpp TLS patch anchor did not match')
+    }
+    await writeFile(lwsfWalletCppPath, patchedLwsfWalletCpp, 'utf8')
+
+    const lwsfWalletManagerPath = join(build.cwd, 'src/wallet_manager.cpp')
+    const lwsfWalletManager = await readFile(lwsfWalletManagerPath, 'utf8')
+    const patchedLwsfWalletManager = lwsfWalletManager
+      .replace(
+        `      void setDaemonAddress(const std::string &address) override
+      {`,
+        `      void setDaemonAddress(const std::string &address) override
+      {`
+      )
+      .replace(
+        `        client_.set_server(std::move(url.host), std::to_string(url.port), boost::none, std::move(options));
+      }
+
+    //! returns whether the daemon can be reached`,
+        `        client_.set_server(std::move(url.host), std::to_string(url.port), boost::none, std::move(options));
+      }
+
+      void setDaemonAddressWithTls(
+        const std::string &address,
+        epee::net_utils::ssl_options_t options,
+        const std::string &proxy_address) override
+      {
+        epee::net_utils::http::url_content url{};
+        if (!epee::net_utils::parse_url(address, url))
+          throw std::runtime_error{"Invalid LWS URL: " + address};
+        if (!url.m_uri_content.m_path.empty())
+          throw std::runtime_error{"LWS URL contains path (unsupported)"};
+        if (proxy_address.empty())
+          client_.set_connector(epee::net_utils::direct_connect{});
+        else
+        {
+          auto endpoint = net::get_tcp_endpoint(proxy_address);
+          if (!endpoint)
+            throw std::runtime_error{"Invalid SOCKS proxy address"};
+          client_.set_connector(net::socks::connector{std::move(*endpoint)});
+        }
+        if (!url.port)
+          url.port = options.support == epee::net_utils::ssl_support_t::e_ssl_support_disabled ? 80 : 443;
+        client_.set_server(std::move(url.host), std::to_string(url.port),
+                           boost::none, std::move(options));
+      }
+
+    //! returns whether the daemon can be reached`
+      )
+    if (!patchedLwsfWalletManager.includes('setDaemonAddressWithTls')) {
+      throw new Error('lwsf wallet_manager.cpp TLS patch anchor did not match')
+    }
+    await writeFile(lwsfWalletManagerPath, patchedLwsfWalletManager, 'utf8')
 
     build.exportEnv({
       PKG_CONFIG_PATH: join(prefixPath, '/lib/pkgconfig')

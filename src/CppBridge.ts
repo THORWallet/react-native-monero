@@ -6,6 +6,8 @@ import type {
   EncodeUriParams,
   GeneratedWallet,
   MoneroAccountSummary,
+  MoneroNodeConfig,
+  MoneroTlsPeerIdentity,
   NetworkType,
   ParsedUri,
   Recipient,
@@ -41,6 +43,21 @@ export class CppBridge {
 
   constructor(moneroLwsfModule: NativeMoneroLwsfModule) {
     this.module = moneroLwsfModule
+  }
+
+  private nodeArguments(
+    node: string | MoneroNodeConfig
+  ): [string, string, string, string] {
+    const config: MoneroNodeConfig =
+      typeof node === 'string' ? { address: node } : node
+    const tls = config.tls
+    const value =
+      tls?.mode === 'fingerprint'
+        ? tls.sha256
+        : tls?.mode === 'certificate'
+          ? tls.pem
+          : ''
+    return [config.address, tls?.mode ?? '', value, config.proxyAddress ?? '']
   }
 
   /**
@@ -87,14 +104,31 @@ export class CppBridge {
   async getNetworkBlockHeight(
     backend: WalletBackend,
     nettype: NetworkType,
-    daemonAddress: string
+    daemon: string | MoneroNodeConfig
   ): Promise<number> {
     const response = await this.module.callMonero('getNetworkBlockHeight', [
+      this.module.documentDirectory,
       backend,
       networkTypeToIntString(nettype),
-      daemonAddress
+      ...this.nodeArguments(daemon)
     ])
     return parseInt(response, 10)
+  }
+
+  /**
+   * Perform one direct TLS handshake and return the peer leaf certificate's
+   * SHA-256 fingerprint. No daemon RPC or wallet operation is performed.
+   */
+  async discoverTlsPeerIdentity(
+    node: string | MoneroNodeConfig
+  ): Promise<MoneroTlsPeerIdentity> {
+    const config: MoneroNodeConfig =
+      typeof node === 'string' ? { address: node } : node
+    const response = await this.module.callMonero('discoverTlsPeerIdentity', [
+      config.address,
+      config.proxyAddress ?? ''
+    ])
+    return JSON.parse(response) as MoneroTlsPeerIdentity
   }
 
   /**
@@ -132,7 +166,7 @@ export class CppBridge {
     password: string,
     nettype: NetworkType,
     restoreHeight: number,
-    daemonAddress: string
+    daemon: string | MoneroNodeConfig
   ): Promise<WalletStatus> {
     const response = await this.module.callMonero('openWallet', [
       this.module.documentDirectory,
@@ -142,7 +176,7 @@ export class CppBridge {
       password,
       networkTypeToIntString(nettype),
       restoreHeight.toString(),
-      daemonAddress
+      ...this.nodeArguments(daemon)
     ])
     return JSON.parse(response) as WalletStatus
   }

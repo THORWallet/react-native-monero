@@ -18,7 +18,7 @@
 // | OpenSSL    | custom            | custom                |
 //
 
-import { mkdir, rm, writeFile } from 'fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { basename, join } from 'path'
 
 import { boost } from './libraries/boost'
@@ -42,6 +42,21 @@ const ffi = defineLib({
   async build(build, platform, prefixPath) {
     // Source list (from src/):
     const srcPath = join(__dirname, '../src')
+    // OpenSSL cannot access the iOS/Android system certificate stores. Embed
+    // Mozilla's CA bundle into the native library; monero-methods writes it
+    // into the app-private document directory before creating any TLS client.
+    const caBundle = await readFile(
+      join(srcPath, 'monero-wrapper/ca-bundle.pem'),
+      'utf8'
+    )
+    await writeFile(
+      join(build.cwd, 'ca-bundle.hpp'),
+      `#pragma once
+#include <cstddef>
+inline constexpr char kMoneroCaBundle[] = ${JSON.stringify(caBundle)};
+inline constexpr std::size_t kMoneroCaBundleSize = sizeof(kMoneroCaBundle) - 1;
+`
+    )
     const sources: string[] = [
       'monero-wrapper/monero-methods.cpp',
       'monero-wrapper/nym-fetch.cpp'
@@ -57,6 +72,7 @@ const ffi = defineLib({
 
     // Compile flags:
     const includePaths = [
+      build.cwd,
       join(prefixPath, 'include'),
       join(lwsfPath, 'include'),
       join(build.basePath, 'monero/src'),

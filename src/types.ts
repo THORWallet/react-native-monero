@@ -12,6 +12,32 @@ export function networkTypeToIntString(type: NetworkType): string {
 
 export type WalletBackend = 'lws' | 'monerod'
 
+/**
+ * TLS verification applied to one daemon connection.
+ *
+ * HTTPS defaults to bundled-ca when this is omitted. Lenient verification is
+ * never selected implicitly.
+ */
+export type MoneroTlsConfig =
+  | { mode: 'bundled-ca' }
+  | { mode: 'fingerprint'; sha256: string }
+  | { mode: 'certificate'; pem: string }
+  | { mode: 'unverified' }
+  | { mode: 'onion' }
+
+/** Daemon endpoint and its connection-specific transport policy. */
+export interface MoneroNodeConfig {
+  address: string
+  tls?: MoneroTlsConfig
+  /** SOCKS proxy in host:port form. Required for native .onion resolution. */
+  proxyAddress?: string
+}
+
+/** SHA-256 identity returned by discoverTlsPeerIdentity. */
+export interface MoneroTlsPeerIdentity {
+  sha256Fingerprint: string
+}
+
 export interface GeneratedWallet {
   mnemonic: string
   secretSpendKey: string

@@ -10,8 +10,16 @@
 #include <limits>
 #include <ctime>
 #include <atomic>
+#include <cctype>
+#include <fstream>
+#include <iomanip>
+#include <openssl/sha.h>
 #include "monero-methods.hpp"
 #include "nym-fetch.hpp"
+#include "ca-bundle.hpp"
+#include "net/http_client.h"
+#include "net/parse.h"
+#include "net/socks_connect.h"
 #include "wallet/api/wallet2_api.h"
 #include "lws_frontend.h"
 
@@ -172,6 +180,7 @@ struct WalletEntry {
   std::string backend;
   std::string path;
   std::string walletId;
+  std::string connectionKey;
   
   uint64_t cachedSyncedHeight = 0;
   uint64_t cachedBalance = 0;
@@ -271,6 +280,179 @@ static Monero::WalletManager* getWalletManager(const std::string& backend) {
   } else {
     return Monero::WalletManagerFactory::getWalletManager();
   }
+}
+
+/**
+ * Installs the bundled Mozilla roots before any OpenSSL-backed daemon client
+ * is created. Mobile OpenSSL builds cannot read the platform trust store, so
+ * verified TLS needs an explicit CA file. The file is app-private and is
+ * rewritten once per process so package updates cannot retain stale roots.
+ */
+static std::string sha256Hex(const std::string& value) {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (unsigned char byte : digest) out << std::setw(2) << static_cast<unsigned>(byte);
+  return out.str();
+}
+
+static std::string installBundledCa(const std::string& documentDirectory) {
+  static std::mutex mutex;
+  static std::string configuredDirectory;
+  static std::string configuredPath;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (configuredDirectory == documentDirectory) return configuredPath;
+  if (documentDirectory.empty()) {
+    throw std::runtime_error("Cannot configure TLS trust without a document directory");
+  }
+
+  const std::string path = documentDirectory + "/monero-ca-bundle.pem";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(kMoneroCaBundle, static_cast<std::streamsize>(kMoneroCaBundleSize));
+  output.close();
+  if (!output) {
+    throw std::runtime_error("Failed to install Monero TLS CA bundle");
+  }
+  configuredDirectory = documentDirectory;
+  configuredPath = path;
+  return path;
+}
+
+static std::string installCertificatePem(
+    const std::string& documentDirectory, const std::string& pem) {
+  static constexpr std::size_t MAX_CERTIFICATE_PEM_SIZE = 256 * 1024;
+  if (pem.empty() || pem.size() > MAX_CERTIFICATE_PEM_SIZE) {
+    throw std::runtime_error("TLS certificate PEM must be between 1 byte and 256 KiB");
+  }
+  const std::string begin = "-----BEGIN CERTIFICATE-----";
+  const std::string end = "-----END CERTIFICATE-----";
+  const auto beginPos = pem.find(begin);
+  const auto endPos = pem.find(end);
+  if (beginPos == std::string::npos || endPos == std::string::npos ||
+      pem.find(begin, beginPos + begin.size()) != std::string::npos ||
+      pem.find(end, endPos + end.size()) != std::string::npos ||
+      endPos < beginPos) {
+    throw std::runtime_error("TLS certificate mode requires exactly one PEM certificate");
+  }
+  if (documentDirectory.empty()) {
+    throw std::runtime_error("Cannot install TLS certificate without a document directory");
+  }
+  const std::string path =
+      documentDirectory + "/monero-peer-" + sha256Hex(pem) + ".pem";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(pem.data(), static_cast<std::streamsize>(pem.size()));
+  output.close();
+  if (!output) throw std::runtime_error("Failed to install TLS certificate PEM");
+  return path;
+}
+
+static std::string lowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+static bool isOnionHost(const std::string& host) {
+  const std::string lower = lowerAscii(host);
+  return lower.size() > 6 &&
+      lower.compare(lower.size() - 6, 6, ".onion") == 0;
+}
+
+static std::vector<std::uint8_t> parseFingerprint(const std::string& input) {
+  std::string hex;
+  hex.reserve(input.size());
+  for (char c : input) {
+    if (c == ':') continue;
+    if (!std::isxdigit(static_cast<unsigned char>(c))) {
+      throw std::runtime_error("TLS fingerprint must be hexadecimal SHA-256");
+    }
+    hex.push_back(c);
+  }
+  if (hex.size() != SSL_FINGERPRINT_SIZE * 2) {
+    throw std::runtime_error("TLS fingerprint must contain exactly 32 bytes");
+  }
+  std::vector<std::uint8_t> bytes;
+  bytes.reserve(SSL_FINGERPRINT_SIZE);
+  for (std::size_t i = 0; i < hex.size(); i += 2) {
+    bytes.push_back(static_cast<std::uint8_t>(
+        std::stoul(hex.substr(i, 2), nullptr, 16)));
+  }
+  return bytes;
+}
+
+struct DaemonConnection {
+  std::string address;
+  std::string proxyAddress;
+  std::string key;
+  epee::net_utils::ssl_options_t sslOptions;
+
+  DaemonConnection()
+      : sslOptions(epee::net_utils::ssl_support_t::e_ssl_support_disabled) {}
+};
+
+static DaemonConnection makeDaemonConnection(
+    const std::string& documentDirectory,
+    std::string address,
+    std::string mode,
+    const std::string& value,
+    std::string proxyAddress) {
+  epee::net_utils::http::url_content url{};
+  if (!epee::net_utils::parse_url(address, url)) {
+    throw std::runtime_error("Invalid daemon URL");
+  }
+  const std::string scheme = lowerAscii(url.schema);
+  const bool https = scheme == "https";
+  if (!https && scheme != "http") {
+    throw std::runtime_error("Daemon URL must use http or https");
+  }
+  const bool onion = isOnionHost(url.host);
+  mode = lowerAscii(mode);
+  if (mode.empty()) mode = https ? "bundled-ca" : "disabled";
+
+  if (onion && mode != "onion") {
+    throw std::runtime_error("A .onion daemon requires TLS onion mode");
+  }
+  if (mode == "onion" && !onion) {
+    throw std::runtime_error("TLS onion mode is only valid for .onion hosts");
+  }
+  if (mode == "onion" && proxyAddress.empty()) {
+    throw std::runtime_error("A .onion daemon requires a SOCKS proxy address");
+  }
+  if (!https && mode != "disabled" && mode != "onion") {
+    throw std::runtime_error("TLS verification modes require an https daemon");
+  }
+
+  DaemonConnection out;
+  out.address = std::move(address);
+  out.proxyAddress = std::move(proxyAddress);
+  if (mode == "disabled") {
+    out.sslOptions =
+        epee::net_utils::ssl_support_t::e_ssl_support_disabled;
+  } else if (mode == "bundled-ca") {
+    out.sslOptions =
+        epee::net_utils::ssl_support_t::e_ssl_support_enabled;
+    out.sslOptions.ca_path = installBundledCa(documentDirectory);
+  } else if (mode == "fingerprint") {
+    out.sslOptions = epee::net_utils::ssl_options_t{
+        {parseFingerprint(value)}, ""};
+  } else if (mode == "certificate") {
+    out.sslOptions = epee::net_utils::ssl_options_t{
+        {}, installCertificatePem(documentDirectory, value)};
+  } else if (mode == "unverified" || mode == "onion") {
+    out.sslOptions = https
+        ? epee::net_utils::ssl_options_t{
+              epee::net_utils::ssl_support_t::e_ssl_support_enabled}
+        : epee::net_utils::ssl_options_t{
+              epee::net_utils::ssl_support_t::e_ssl_support_disabled};
+    out.sslOptions.verification = epee::net_utils::ssl_verification_t::none;
+  } else {
+    throw std::runtime_error("Unsupported TLS mode: " + mode);
+  }
+  out.key = out.address + "\n" + mode + "\n" + sha256Hex(value) +
+      "\n" + out.proxyAddress;
+  return out;
 }
 
 /**
@@ -395,28 +577,77 @@ std::string seedAndKeysFromMnemonic(const std::vector<std::string> &args) {
 
 /**
  * Get network blockchain height from daemon.
- * Args: backend, nettype, daemonAddress
+ * Args: documentDirectory, backend, nettype, daemonAddress, tlsMode,
+ *       tlsValue, proxyAddress
  * Returns: blockchain height as string
  */
 std::string getNetworkBlockHeight(const std::vector<std::string> &args) {
-  std::string backend = args[0];
-  int nettype = std::stoi(args[1]);
-  std::string daemon_address = args[2];
+  std::string documentDirectory = args[0];
+  std::string backend = args[1];
+  int nettype = std::stoi(args[2]);
+  (void)nettype;
+  DaemonConnection connection = makeDaemonConnection(
+      documentDirectory, args[3], args[4], args[5], args[6]);
   
   // The WalletManager is a shared singleton, but its daemon address is only
   // read by this method, which re-sets it on every call before querying. Wallet
   // operations connect via their own wallet->init(), not the manager's address,
   // so this transient mutation cannot perturb other wallets/sessions.
   Monero::WalletManager* manager = getWalletManager(backend);
-  manager->setDaemonAddress(daemon_address);
+  manager->setDaemonAddressWithTls(
+      connection.address, connection.sslOptions, connection.proxyAddress);
   
   // Check if connected
   if (!manager->connected()) {
-    throw std::runtime_error("Failed to connect to daemon at " + daemon_address);
+    throw std::runtime_error(
+        "Failed to connect to daemon at " + connection.address);
   }
   
   uint64_t height = manager->blockchainHeight();
   return std::to_string(height);
+}
+
+/**
+ * Perform only a direct TLS handshake and return the peer leaf SHA-256
+ * fingerprint. This deliberately uses verification=none for TOFU discovery;
+ * callers must confirm and persist the returned fingerprint before use.
+ * Args: daemonAddress, proxyAddress
+ */
+std::string discoverTlsPeerIdentity(const std::vector<std::string> &args) {
+  epee::net_utils::http::url_content url{};
+  if (!epee::net_utils::parse_url(args[0], url) ||
+      lowerAscii(url.schema) != "https") {
+    throw std::runtime_error(
+        "TLS peer identity discovery requires an https daemon URL");
+  }
+  const bool onion = isOnionHost(url.host);
+  const std::string proxyAddress = args[1];
+  if (onion && proxyAddress.empty()) {
+    throw std::runtime_error("A .onion daemon requires a SOCKS proxy address");
+  }
+
+  std::string fingerprint;
+  epee::net_utils::ssl_options_t options{
+      epee::net_utils::ssl_support_t::e_ssl_support_enabled};
+  options.verification = epee::net_utils::ssl_verification_t::none;
+  options.peer_fingerprint_callback =
+      [&fingerprint](const std::string& value) { fingerprint = value; };
+
+  epee::net_utils::http::http_simple_client client;
+  if (!proxyAddress.empty()) {
+    auto endpoint = net::get_tcp_endpoint(proxyAddress);
+    if (!endpoint) throw std::runtime_error("Invalid SOCKS proxy address");
+    client.set_connector(net::socks::connector{std::move(*endpoint)});
+  }
+  const std::uint64_t port = url.port == 0 ? 443 : url.port;
+  client.set_server(
+      std::move(url.host), std::to_string(port), boost::none,
+      std::move(options));
+  if (!client.connect(std::chrono::seconds(15)) || fingerprint.empty()) {
+    throw std::runtime_error("Failed to discover TLS peer identity");
+  }
+  client.disconnect();
+  return "{\"sha256Fingerprint\":\"" + jsonEscape(fingerprint) + "\"}";
 }
 
 /**
@@ -436,7 +667,8 @@ std::string isValidAddress(const std::vector<std::string> &args) {
 
 /**
  * Open or create a wallet.
- * Args: documentDirectory, walletId, backend, mnemonic, password, nettype, restoreHeight, daemonAddress
+ * Args: documentDirectory, walletId, backend, mnemonic, password, nettype,
+ *       restoreHeight, daemonAddress, tlsMode, tlsValue, proxyAddress
  * Returns: JSON with syncedHeight, networkHeight, balance, and unlockedBalance
  */
 std::string openWallet(const std::vector<std::string> &args) {
@@ -447,7 +679,8 @@ std::string openWallet(const std::vector<std::string> &args) {
   std::string password = args[4];
   int nettype = std::stoi(args[5]);
   uint64_t restoreHeight = std::stoull(args[6]);
-  std::string daemonAddress = args[7];
+  DaemonConnection connection = makeDaemonConnection(
+      documentDirectory, args[7], args[8], args[9], args[10]);
   
   Monero::NetworkType network = static_cast<Monero::NetworkType>(nettype);
   Monero::WalletManager* manager = getWalletManager(backend);
@@ -456,6 +689,10 @@ std::string openWallet(const std::vector<std::string> &args) {
   auto it = g_wallets.find(walletId);
   if (it != g_wallets.end()) {
     WalletEntry& entry = it->second;
+    if (entry.connectionKey != connection.key) {
+      throw std::runtime_error(
+          "Wallet is already open with a different daemon or TLS policy");
+    }
     Monero::Wallet* wallet = entry.wallet;
     wallet->startRefresh();
     
@@ -500,20 +737,16 @@ std::string openWallet(const std::vector<std::string> &args) {
     throw std::runtime_error("Wallet error: " + error);
   }
   
-  bool isLws = (backend == "lws");
-  // Always pass use_ssl=false here; the backends derive TLS from the address
-  // scheme instead. wallet2 drops this flag entirely (WalletImpl::doInit calls
-  // wallet2::init without it, which defaults to ssl_support_autodetect), so it
-  // never affected monerod. lwsf DOES honor it: true selects
-  // ssl_support_enabled, whose certificate verification hard-fails on iOS and
-  // Android (no OpenSSL system CA store in the app sandbox), silently dropping
-  // every LWS connection at the TLS handshake, so LWS wallets polled forever
-  // with networkHeight 0 (regression shipped in 0.2.0). false keeps lwsf on
-  // ssl_support_autodetect: TLS is still used for https:// addresses, with
-  // tolerant verification, the long-standing epee behavior. The Nym path is
-  // unaffected either way: NymHttpClient derives its scheme from
-  // m_use_https || port 443, and lwsf-over-Nym bypasses epee TLS entirely.
-  wallet->init(daemonAddress, 0, "", "", false, isLws, "");
+  const bool isLws = (backend == "lws");
+  if (!wallet->initWithTls(
+          connection.address, 0, "", "", isLws, connection.proxyAddress,
+          connection.sslOptions)) {
+    const std::string error = wallet->errorString();
+    manager->closeWallet(wallet);
+    throw std::runtime_error(
+        "Failed to initialize wallet daemon connection" +
+        (error.empty() ? std::string() : ": " + error));
+  }
 
   auto listener = std::make_unique<WalletListeners>(wallet, walletId);
   wallet->setListener(listener.get());
@@ -531,6 +764,7 @@ std::string openWallet(const std::vector<std::string> &args) {
   entry.backend = backend;
   entry.path = path;
   entry.walletId = walletId;
+  entry.connectionKey = connection.key;
   entry.cachedSyncedHeight = syncedHeight;
   entry.cachedBalance = balance;
   entry.cachedUnlockedBalance = unlockedBalance;
@@ -1274,9 +1508,10 @@ const MoneroMethod moneroMethods[] = {
   { "hello", 0, hello },
   { "generateWallet", 2, generateWallet },
   { "seedAndKeysFromMnemonic", 2, seedAndKeysFromMnemonic },
-  { "getNetworkBlockHeight", 3, getNetworkBlockHeight },
+  { "getNetworkBlockHeight", 7, getNetworkBlockHeight },
+  { "discoverTlsPeerIdentity", 2, discoverTlsPeerIdentity },
   { "isValidAddress", 2, isValidAddress },
-  { "openWallet", 8, openWallet },
+  { "openWallet", 11, openWallet },
   { "getWalletStatus", 1, getWalletStatus },
   { "getAllTransactions", 4, getAllTransactions },
   { "getPendingTransactions", 3, getPendingTransactions },
