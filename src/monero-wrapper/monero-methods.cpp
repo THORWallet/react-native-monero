@@ -13,7 +13,9 @@
 #include <cctype>
 #include <fstream>
 #include <iomanip>
+#include <openssl/pem.h>
 #include <openssl/sha.h>
+#include <openssl/x509v3.h>
 #include "monero-methods.hpp"
 #include "nym-fetch.hpp"
 #include "ca-bundle.hpp"
@@ -283,6 +285,21 @@ static Monero::WalletManager* getWalletManager(const std::string& backend) {
 }
 
 /**
+ * Closes and untracks one wallet. The entry is always removed, even when the
+ * backend reports a failed close, so a wallet can never become unclosable.
+ */
+static void closeWalletEntry(
+    const std::map<std::string, WalletEntry>::iterator& it) {
+  WalletEntry& entry = it->second;
+  entry.wallet->setListener(nullptr);
+  disposeRetainedTxs(entry.walletId, entry.wallet);
+  Monero::WalletManager* manager = getWalletManager(entry.backend);
+  const bool closed = manager->closeWallet(entry.wallet);
+  g_wallets.erase(it);
+  if (!closed) throw std::runtime_error("Failed to close wallet");
+}
+
+/**
  * Installs the bundled Mozilla roots before any OpenSSL-backed daemon client
  * is created. Mobile OpenSSL builds cannot read the platform trust store, so
  * verified TLS needs an explicit CA file. The file is app-private and is
@@ -320,26 +337,66 @@ static std::string installBundledCa(const std::string& documentDirectory) {
 }
 
 static std::string installCertificatePem(
-    const std::string& documentDirectory, const std::string& pem) {
+    const std::string& documentDirectory,
+    const std::string& pem,
+    const bool customCa) {
   static constexpr std::size_t MAX_CERTIFICATE_PEM_SIZE = 256 * 1024;
   if (pem.empty() || pem.size() > MAX_CERTIFICATE_PEM_SIZE) {
     throw std::runtime_error("TLS certificate PEM must be between 1 byte and 256 KiB");
   }
   const std::string begin = "-----BEGIN CERTIFICATE-----";
   const std::string end = "-----END CERTIFICATE-----";
-  const auto beginPos = pem.find(begin);
-  const auto endPos = pem.find(end);
-  if (beginPos == std::string::npos || endPos == std::string::npos ||
-      pem.find(begin, beginPos + begin.size()) != std::string::npos ||
-      pem.find(end, endPos + end.size()) != std::string::npos ||
-      endPos < beginPos) {
-    throw std::runtime_error("TLS certificate mode requires exactly one PEM certificate");
+  std::size_t endCount = 0;
+  for (std::size_t endCursor = 0;
+       (endCursor = pem.find(end, endCursor)) != std::string::npos;
+       endCursor += end.size()) {
+    ++endCount;
+  }
+  std::size_t cursor = 0;
+  std::size_t certificateCount = 0;
+  while (true) {
+    const auto beginPos = pem.find(begin, cursor);
+    if (beginPos == std::string::npos) break;
+    const auto endPos = pem.find(end, beginPos + begin.size());
+    if (endPos == std::string::npos) {
+      throw std::runtime_error("TLS certificate PEM has an unterminated certificate");
+    }
+    const auto blockEnd = endPos + end.size();
+    const std::string block = pem.substr(beginPos, blockEnd - beginPos);
+    std::unique_ptr<BIO, decltype(&BIO_free)> bio(
+        BIO_new_mem_buf(block.data(), static_cast<int>(block.size())), &BIO_free);
+    if (!bio) throw std::runtime_error("Failed to parse TLS certificate PEM");
+    std::unique_ptr<X509, decltype(&X509_free)> certificate(
+        PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr), &X509_free);
+    if (!certificate) {
+      throw std::runtime_error("TLS certificate PEM contains an invalid certificate");
+    }
+    if (customCa && X509_check_ca(certificate.get()) <= 0) {
+      throw std::runtime_error("TLS custom CA PEM contains a non-CA certificate");
+    }
+    // Reject only an explicit `basicConstraints: CA:TRUE`. Monerod's generated
+    // certificate is a self-signed V1 leaf, which X509_check_ca also reports as
+    // CA-capable, and pinning it is the main use of this mode.
+    if (!customCa && X509_check_ca(certificate.get()) == 1) {
+      throw std::runtime_error(
+          "TLS certificate mode requires a peer certificate, not a CA");
+    }
+    ++certificateCount;
+    cursor = blockEnd;
+  }
+  if (certificateCount == 0 || certificateCount != endCount ||
+      (!customCa && certificateCount != 1)) {
+    throw std::runtime_error(
+        customCa
+            ? "TLS custom CA mode requires one or more PEM CA certificates"
+            : "TLS certificate mode requires exactly one PEM certificate");
   }
   if (documentDirectory.empty()) {
     throw std::runtime_error("Cannot install TLS certificate without a document directory");
   }
   const std::string path =
-      documentDirectory + "/monero-peer-" + sha256Hex(pem) + ".pem";
+      documentDirectory + (customCa ? "/monero-custom-ca-" : "/monero-peer-") +
+      sha256Hex(pem) + ".pem";
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   output.write(pem.data(), static_cast<std::streamsize>(pem.size()));
   output.close();
@@ -407,20 +464,33 @@ static DaemonConnection makeDaemonConnection(
   if (!https && scheme != "http") {
     throw std::runtime_error("Daemon URL must use http or https");
   }
+  const bool externalTransport = nymfetch::isEnabled();
   const bool onion = isOnionHost(url.host);
   mode = lowerAscii(mode);
-  if (mode.empty()) mode = https ? "bundled-ca" : "disabled";
+  if (mode.empty()) {
+    mode = externalTransport ? "external" : (https ? "bundled-ca" : "disabled");
+  }
 
-  if (onion && mode != "onion") {
+  if (externalTransport && mode != "external") {
+    throw std::runtime_error(
+        "Nym transport requires TLS external mode; native TLS policies "
+        "cannot be enforced by the JS transport");
+  }
+  if (!externalTransport && mode == "external") {
+    throw std::runtime_error(
+        "TLS external mode requires the Nym fetch transport");
+  }
+  if (!externalTransport && onion && mode != "onion") {
     throw std::runtime_error("A .onion daemon requires TLS onion mode");
   }
-  if (mode == "onion" && !onion) {
+  if (!externalTransport && mode == "onion" && !onion) {
     throw std::runtime_error("TLS onion mode is only valid for .onion hosts");
   }
-  if (mode == "onion" && proxyAddress.empty()) {
+  if (!externalTransport && mode == "onion" && proxyAddress.empty()) {
     throw std::runtime_error("A .onion daemon requires a SOCKS proxy address");
   }
-  if (!https && mode != "disabled" && mode != "onion") {
+  if (!https && mode != "disabled" && mode != "onion" &&
+      mode != "external") {
     throw std::runtime_error("TLS verification modes require an https daemon");
   }
 
@@ -439,8 +509,20 @@ static DaemonConnection makeDaemonConnection(
         {parseFingerprint(value)}, ""};
   } else if (mode == "certificate") {
     out.sslOptions = epee::net_utils::ssl_options_t{
-        {}, installCertificatePem(documentDirectory, value)};
+        {}, installCertificatePem(documentDirectory, value, false)};
+  } else if (mode == "custom-ca") {
+    out.sslOptions = epee::net_utils::ssl_options_t{
+        {}, installCertificatePem(documentDirectory, value, true)};
+    out.sslOptions.verification =
+        epee::net_utils::ssl_verification_t::user_ca;
   } else if (mode == "unverified" || mode == "onion") {
+    out.sslOptions = https
+        ? epee::net_utils::ssl_options_t{
+              epee::net_utils::ssl_support_t::e_ssl_support_enabled}
+        : epee::net_utils::ssl_options_t{
+              epee::net_utils::ssl_support_t::e_ssl_support_disabled};
+    out.sslOptions.verification = epee::net_utils::ssl_verification_t::none;
+  } else if (mode == "external") {
     out.sslOptions = https
         ? epee::net_utils::ssl_options_t{
               epee::net_utils::ssl_support_t::e_ssl_support_enabled}
@@ -588,6 +670,10 @@ std::string getNetworkBlockHeight(const std::vector<std::string> &args) {
   (void)nettype;
   DaemonConnection connection = makeDaemonConnection(
       documentDirectory, args[3], args[4], args[5], args[6]);
+  if (nymfetch::isEnabled() && backend != "lws") {
+    throw std::runtime_error(
+        "Monerod network-height probes are unavailable through Nym");
+  }
   
   // The WalletManager is a shared singleton, but its daemon address is only
   // read by this method, which re-sets it on every call before querying. Wallet
@@ -681,39 +767,49 @@ std::string openWallet(const std::vector<std::string> &args) {
   uint64_t restoreHeight = std::stoull(args[6]);
   DaemonConnection connection = makeDaemonConnection(
       documentDirectory, args[7], args[8], args[9], args[10]);
-  
+
   Monero::NetworkType network = static_cast<Monero::NetworkType>(nettype);
-  Monero::WalletManager* manager = getWalletManager(backend);
-  
+
   // Check if wallet is already open
   auto it = g_wallets.find(walletId);
   if (it != g_wallets.end()) {
     WalletEntry& entry = it->second;
-    if (entry.connectionKey != connection.key) {
+    // A different backend or network is a different wallet, so refuse it
+    // instead of discarding the open one's retained transactions for an open
+    // that cannot succeed against the same wallet file.
+    if (entry.backend != backend || entry.wallet->nettype() != network) {
       throw std::runtime_error(
-          "Wallet is already open with a different daemon or TLS policy");
+          "Wallet is already open with a different backend or network");
     }
-    Monero::Wallet* wallet = entry.wallet;
-    wallet->startRefresh();
-    
-    uint64_t syncedHeight = wallet->blockChainHeight();
-    uint64_t networkHeight = wallet->daemonBlockChainHeight();
-    uint64_t balance = wallet->balanceAll();
-    uint64_t unlockedBalance = wallet->unlockedBalanceAll();
-    
-    entry.cachedSyncedHeight = syncedHeight;
-    entry.cachedBalance = balance;
-    entry.cachedUnlockedBalance = unlockedBalance;
-    
-    std::string json = "{";
-    json += "\"syncedHeight\":" + std::to_string(syncedHeight) + ",";
-    json += "\"networkHeight\":" + std::to_string(networkHeight) + ",";
-    json += "\"balance\":\"" + std::to_string(balance) + "\",";
-    json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
-    json += "\"refreshed\":false";
-    json += "}";
-    return json;
+    if (entry.connectionKey == connection.key) {
+      Monero::Wallet* wallet = entry.wallet;
+      wallet->startRefresh();
+
+      uint64_t syncedHeight = wallet->blockChainHeight();
+      uint64_t networkHeight = wallet->daemonBlockChainHeight();
+      uint64_t balance = wallet->balanceAll();
+      uint64_t unlockedBalance = wallet->unlockedBalanceAll();
+
+      entry.cachedSyncedHeight = syncedHeight;
+      entry.cachedBalance = balance;
+      entry.cachedUnlockedBalance = unlockedBalance;
+
+      std::string json = "{";
+      json += "\"syncedHeight\":" + std::to_string(syncedHeight) + ",";
+      json += "\"networkHeight\":" + std::to_string(networkHeight) + ",";
+      json += "\"balance\":\"" + std::to_string(balance) + "\",";
+      json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
+      json += "\"refreshed\":" +
+          std::string(entry.listener->hasRefreshed() ? "true" : "false");
+      json += "}";
+      return json;
+    }
+    // A repeated open with new transport settings is an explicit
+    // reconfiguration request. Close first so failed TLS settings do not latch.
+    closeWalletEntry(it);
   }
+
+  Monero::WalletManager* manager = getWalletManager(backend);
   
   requireSafeWalletId(walletId);
   std::string path = documentDirectory + "/" + backend + "_" + walletId;
@@ -733,19 +829,27 @@ std::string openWallet(const std::vector<std::string> &args) {
   
   if (wallet->status() != Monero::Wallet::Status_Ok) {
     std::string error = wallet->errorString();
-    manager->closeWallet(wallet);
+    manager->closeWallet(wallet, false);
     throw std::runtime_error("Wallet error: " + error);
   }
   
   const bool isLws = (backend == "lws");
-  if (!wallet->initWithTls(
-          connection.address, 0, "", "", isLws, connection.proxyAddress,
-          connection.sslOptions)) {
-    const std::string error = wallet->errorString();
-    manager->closeWallet(wallet);
-    throw std::runtime_error(
-        "Failed to initialize wallet daemon connection" +
-        (error.empty() ? std::string() : ": " + error));
+  try {
+    if (!wallet->initWithTls(
+            connection.address, 0, "", "", isLws, connection.proxyAddress,
+            connection.sslOptions)) {
+      const std::string error = wallet->errorString();
+      throw std::runtime_error(
+          "Failed to initialize wallet daemon connection" +
+          (error.empty() ? std::string() : ": " + error));
+    }
+  } catch (...) {
+    try {
+      manager->closeWallet(wallet, false);
+    } catch (...) {
+      // Preserve the initialization error.
+    }
+    throw;
   }
 
   auto listener = std::make_unique<WalletListeners>(wallet, walletId);
@@ -831,15 +935,9 @@ std::string getWalletStatus(const std::vector<std::string> &args) {
  */
 std::string closeWallet(const std::vector<std::string> &args) {
   std::string walletId = args[0];
-  WalletEntry& entry = findWalletOrThrow(walletId);
-  Monero::WalletManager* manager = getWalletManager(entry.backend);
-
-  entry.wallet->setListener(nullptr);
-
-  disposeRetainedTxs(walletId, entry.wallet);
-  manager->closeWallet(entry.wallet);
-
-  g_wallets.erase(walletId);
+  auto it = g_wallets.find(walletId);
+  if (it == g_wallets.end()) throw std::runtime_error("Wallet not found");
+  closeWalletEntry(it);
   
   return "ok";
 }
@@ -856,12 +954,7 @@ std::string deleteWallet(const std::vector<std::string> &args) {
 
   auto it = g_wallets.find(walletId);
   if (it != g_wallets.end()) {
-    WalletEntry& entry = it->second;
-    Monero::WalletManager* manager = getWalletManager(entry.backend);
-    entry.wallet->setListener(nullptr);
-    disposeRetainedTxs(walletId, entry.wallet);
-    manager->closeWallet(entry.wallet);
-    g_wallets.erase(it);
+    closeWalletEntry(it);
   }
 
   requireSafeWalletId(walletId);
@@ -1284,6 +1377,10 @@ std::string setNymEnabled(const std::vector<std::string> &args) {
   const std::string& enabledStr = args[0];
   const std::string& baseUrl = args[1];
   const bool enabled = (enabledStr == "true" || enabledStr == "1");
+  if (!g_wallets.empty()) {
+    throw std::runtime_error(
+        "Close all wallets before changing the Nym transport configuration");
+  }
   nymfetch::setBaseUrl(baseUrl);
   nymfetch::setEnabled(enabled);
   return "ok";

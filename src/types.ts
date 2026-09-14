@@ -15,15 +15,21 @@ export type WalletBackend = 'lws' | 'monerod'
 /**
  * TLS verification applied to one daemon connection.
  *
- * HTTPS defaults to bundled-ca when this is omitted. Lenient verification is
- * never selected implicitly.
+ * HTTPS defaults to bundled-ca when this is omitted. When Nym is enabled, the
+ * transport is external and JS owns connection security. Lenient native
+ * verification is never selected implicitly.
  */
 export type MoneroTlsConfig =
   | { mode: 'bundled-ca' }
   | { mode: 'fingerprint'; sha256: string }
+  /** Pin one exact peer certificate. */
   | { mode: 'certificate'; pem: string }
+  /** Trust one or more private CA certificates and verify the daemon hostname. */
+  | { mode: 'custom-ca'; pem: string }
   | { mode: 'unverified' }
   | { mode: 'onion' }
+  /** Delegate transport security to the enabled Nym/JS fetch transport. */
+  | { mode: 'external' }
 
 /** Daemon endpoint and its connection-specific transport policy. */
 export interface MoneroNodeConfig {

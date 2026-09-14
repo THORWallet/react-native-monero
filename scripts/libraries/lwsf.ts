@@ -128,9 +128,16 @@ addTask({
   MDEBUG("SSL handshake success");
   return true;`
       )
+      .replace(
+        '(verification != ssl_verification_t::system_ca || host.empty() || MONERO_HOSTNAME_VERIFY(host)(preverified, ctx))',
+        `((verification != ssl_verification_t::system_ca &&
+          verification != ssl_verification_t::user_ca) ||
+         host.empty() || MONERO_HOSTNAME_VERIFY(host)(preverified, ctx))`
+      )
     if (
       !patchedNetSslCpp.includes('SSL_get1_peer_certificate') ||
-      !patchedNetSslCpp.includes('Failed to load CA file at')
+      !patchedNetSslCpp.includes('Failed to load CA file at') ||
+      !patchedNetSslCpp.includes('verification != ssl_verification_t::user_ca')
     ) {
       throw new Error('Monero net_ssl.cpp TLS patch anchor did not match')
     }
@@ -249,6 +256,24 @@ bool WalletImpl::initWithTls(const std::string &daemon_address, uint64_t upper_t
                         std::move(ssl_options)))`
       )
       .replace(
+        '    bool rescan = m_refreshShouldRescan.exchange(false);',
+        `    bool rescan = m_refreshShouldRescan.exchange(false);
+    bool refresh_completed = false;`
+      )
+      .replace(
+        '            m_wallet->refresh(trustedDaemon());',
+        `            m_wallet->refresh(trustedDaemon());
+            refresh_completed = true;`
+      )
+      .replace(
+        `    }while(!rescan && (rescan=m_refreshShouldRescan.exchange(false))); // repeat if not rescanned and rescan was requested
+
+    if (m_wallet2Callback->getListener()) {`,
+        `    }while(!rescan && (rescan=m_refreshShouldRescan.exchange(false))); // repeat if not rescanned and rescan was requested
+
+    if (refresh_completed && m_wallet2Callback->getListener()) {`
+      )
+      .replace(
         `size_t WalletImpl::numSubaddresses(uint32_t accountIndex) const
 {
     return m_wallet->get_num_subaddresses(accountIndex);
@@ -296,7 +321,11 @@ uint32_t WalletImpl::nextUnusedSubaddressIndex(uint32_t accountIndex) const
       )
     if (
       !patchedWalletCpp.includes('bool WalletImpl::initWithTls') ||
-      !patchedWalletCpp.includes('std::move(ssl_options)')
+      !patchedWalletCpp.includes('std::move(ssl_options)') ||
+      !patchedWalletCpp.includes('bool refresh_completed = false;') ||
+      !patchedWalletCpp.includes(
+        'refresh_completed && m_wallet2Callback->getListener()'
+      )
     ) {
       throw new Error(
         'Monero wallet.cpp TLS patch anchor did not match the pinned source'
@@ -387,6 +416,7 @@ void WalletManagerImpl::setDaemonAddressWithTls(
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+#include <stdexcept>
 
 #include "net/http_base.h"
 
@@ -424,6 +454,11 @@ public:
                   epee::net_utils::ssl_options_t ssl_options =
                       epee::net_utils::ssl_support_t::e_ssl_support_autodetect)
       override {
+    if (ssl_options.verification !=
+        epee::net_utils::ssl_verification_t::none) {
+      throw std::runtime_error(
+          "Nym transport cannot enforce native TLS verification policy");
+    }
     m_host = std::move(host);
     m_port = std::move(port);
     m_use_https = (ssl_options.support ==
@@ -476,10 +511,7 @@ private:
     // Monerod wallet2 calls carry their target through set_server(), so
     // use that per-client state instead of the global LWSF base URL.
     if (m_host.empty()) return false;
-    // The native wrapper now seeds enabled TLS for https:// daemon addresses.
-    // Keep the port fallback for compatibility with wallets created by older
-    // callers that did not propagate the scheme into ssl_options.
-    const bool use_https = m_use_https || m_port == "443";
+    const bool use_https = m_use_https;
     std::string base = (use_https ? "https://" : "http://") + m_host;
     if (!m_port.empty()) base += ":" + m_port;
     std::string path(uri.data(), uri.size());
@@ -718,6 +750,27 @@ namespace nymfetch {
     )
     build.log('Patched rpc.cpp for api_key and nym-fetch support')
 
+    // A refresh callback means server data was merged successfully. Upstream
+    // also emits it from an early-return guard on login/RPC failure, which
+    // makes failed TLS handshakes look like a completed first refresh.
+    const lwsfBackendPath = join(build.cwd, 'src/backend.cpp')
+    const lwsfBackend = await readFile(lwsfBackendPath, 'utf8')
+    const patchedLwsfBackend = lwsfBackend
+      .replace(
+        '    std::unique_ptr<wallet, call_refreshed> refresh_on_exit{this};',
+        '    // Failed early returns must not emit WalletListener::refreshed().'
+      )
+      .replace(
+        '    refresh_on_exit.release(); // release before acquiring `sync_listener`.',
+        '    // The explicit callback below is the successful refresh signal.'
+      )
+    if (patchedLwsfBackend.includes('refresh_on_exit')) {
+      throw new Error(
+        'lwsf backend.cpp refresh-result patch anchor did not match'
+      )
+    }
+    await writeFile(lwsfBackendPath, patchedLwsfBackend, 'utf8')
+
     const lwsfWalletHeaderPath = join(build.cwd, 'src/wallet.h')
     const lwsfWalletHeader = await readFile(lwsfWalletHeaderPath, 'utf8')
     const patchedLwsfWalletHeader = lwsfWalletHeader
@@ -788,9 +841,16 @@ namespace nymfetch {
   }`,
         `  bool wallet::init(const std::string &daemon_address, uint64_t limit, const std::string &daemon_username, const std::string &daemon_password, bool use_ssl, bool light_wallet, const std::string &proxy_address)
   {
+    epee::net_utils::http::url_content url{};
+    const bool https =
+      epee::net_utils::parse_url(daemon_address, url) &&
+      url.schema == "https";
     epee::net_utils::ssl_options_t options{
-      use_ssl ? epee::net_utils::ssl_support_t::e_ssl_support_enabled :
-                epee::net_utils::ssl_support_t::e_ssl_support_autodetect
+      use_ssl
+        ? epee::net_utils::ssl_support_t::e_ssl_support_enabled
+        : (https
+            ? epee::net_utils::ssl_support_t::e_ssl_support_autodetect
+            : epee::net_utils::ssl_support_t::e_ssl_support_disabled)
     };
     return initWithTls(daemon_address, limit, daemon_username, daemon_password,
                        light_wallet, proxy_address, std::move(options));
@@ -876,7 +936,12 @@ namespace nymfetch {
     return max_used + 1;
   }`
       )
-    if (!patchedLwsfWalletCpp.includes('wallet::initWithTls')) {
+    if (
+      !patchedLwsfWalletCpp.includes('wallet::initWithTls') ||
+      !patchedLwsfWalletCpp.includes(
+        'epee::net_utils::parse_url(daemon_address, url) &&'
+      )
+    ) {
       throw new Error('lwsf wallet.cpp TLS patch anchor did not match')
     }
     await writeFile(lwsfWalletCppPath, patchedLwsfWalletCpp, 'utf8')
@@ -884,12 +949,6 @@ namespace nymfetch {
     const lwsfWalletManagerPath = join(build.cwd, 'src/wallet_manager.cpp')
     const lwsfWalletManager = await readFile(lwsfWalletManagerPath, 'utf8')
     const patchedLwsfWalletManager = lwsfWalletManager
-      .replace(
-        `      void setDaemonAddress(const std::string &address) override
-      {`,
-        `      void setDaemonAddress(const std::string &address) override
-      {`
-      )
       .replace(
         `        client_.set_server(std::move(url.host), std::to_string(url.port), boost::none, std::move(options));
       }
@@ -925,7 +984,25 @@ namespace nymfetch {
 
     //! returns whether the daemon can be reached`
       )
-    if (!patchedLwsfWalletManager.includes('setDaemonAddressWithTls')) {
+      .replace(
+        `      bool connected(uint32_t *version = NULL) override
+      {
+        if (version)
+          *version = 0;
+        return client_.is_connected();
+      }`,
+        `      bool connected(uint32_t *version = NULL) override
+      {
+        if (version)
+          *version = 0;
+        (void)get_daemon_status();
+        return error_.empty();
+      }`
+      )
+    if (
+      !patchedLwsfWalletManager.includes('setDaemonAddressWithTls') ||
+      !patchedLwsfWalletManager.includes('(void)get_daemon_status();')
+    ) {
       throw new Error('lwsf wallet_manager.cpp TLS patch anchor did not match')
     }
     await writeFile(lwsfWalletManagerPath, patchedLwsfWalletManager, 'utf8')

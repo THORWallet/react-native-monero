@@ -54,7 +54,7 @@ export class CppBridge {
     const value =
       tls?.mode === 'fingerprint'
         ? tls.sha256
-        : tls?.mode === 'certificate'
+        : tls?.mode === 'certificate' || tls?.mode === 'custom-ca'
           ? tls.pem
           : ''
     return [config.address, tls?.mode ?? '', value, config.proxyAddress ?? '']
@@ -471,6 +471,7 @@ export class CppBridge {
    * @param baseUrl - scheme://host[:port] of the LWSF server (must match
    *                  the daemon address used at openWallet time). Empty
    *                  when disabling.
+   * @throws If any wallet is open; close wallets before changing transport.
    */
   async setNymEnabled(enabled: boolean, baseUrl: string): Promise<void> {
     await this.module.callMonero('setNymEnabled', [
