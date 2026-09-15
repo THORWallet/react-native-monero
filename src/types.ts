@@ -88,6 +88,14 @@ export interface WalletStatus {
    * is true.
    */
   refreshed: boolean
+  /** Monero::Wallet status: 0 ok, 1 error, 2 critical. */
+  status: number
+  /**
+   * Last wallet2/lwsf error text; empty when status is 0. A rejected TLS
+   * handshake or an unreachable daemon lands here, so a sync poll loop can
+   * fail over to another node instead of waiting for its own timeout.
+   */
+  errorString: string
 }
 
 /** Wallet status scoped to one subaddress account. */

@@ -10,7 +10,7 @@ const moneroHash = '38bc62741b82cca179fb8e3437a388b0e0f67842' // Nov 7, 2025
 
 addTask({
   name: 'monero.clone',
-  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v1`,
+  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v2`,
   async run(build) {
     await getRepo(
       'monero',
@@ -261,9 +261,32 @@ bool WalletImpl::initWithTls(const std::string &daemon_address, uint64_t upper_t
     bool refresh_completed = false;`
       )
       .replace(
+        `        if (daemonSynced()) {
+            if(rescan)
+                m_wallet->rescan_blockchain(false);
+            m_wallet->refresh(trustedDaemon());`,
+        `        if (daemonSynced()) {
+            clearStatus();
+            if(rescan)
+                m_wallet->rescan_blockchain(false);
+            m_wallet->refresh(trustedDaemon());`
+      )
+      .replace(
         '            m_wallet->refresh(trustedDaemon());',
         `            m_wallet->refresh(trustedDaemon());
             refresh_completed = true;`
+      )
+      .replace(
+        `        } else {
+           LOG_PRINT_L3(__FUNCTION__ << ": skipping refresh - daemon is not synced");
+        }`,
+        `        } else {
+           LOG_PRINT_L3(__FUNCTION__ << ": skipping refresh - daemon is not synced");
+           // react-native build: a rejected TLS handshake or unreachable daemon
+           // is otherwise invisible to the bridge, which only ever sees
+           // "refreshed" staying false until its own stall timeout.
+           setStatusError(tr("daemon is not connected or not synced"));
+        }`
       )
       .replace(
         `    }while(!rescan && (rescan=m_refreshShouldRescan.exchange(false))); // repeat if not rescanned and rescan was requested
@@ -323,6 +346,7 @@ uint32_t WalletImpl::nextUnusedSubaddressIndex(uint32_t accountIndex) const
       !patchedWalletCpp.includes('bool WalletImpl::initWithTls') ||
       !patchedWalletCpp.includes('std::move(ssl_options)') ||
       !patchedWalletCpp.includes('bool refresh_completed = false;') ||
+      !patchedWalletCpp.includes('daemon is not connected or not synced') ||
       !patchedWalletCpp.includes(
         'refresh_completed && m_wallet2Callback->getListener()'
       )

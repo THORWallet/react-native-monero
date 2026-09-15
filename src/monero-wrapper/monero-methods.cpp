@@ -752,6 +752,24 @@ std::string isValidAddress(const std::vector<std::string> &args) {
 }
 
 /**
+ * JSON fields carrying the wallet's last backend error. A rejected TLS
+ * handshake or an unreachable daemon makes the SDK skip its refresh, which is
+ * otherwise invisible to the caller: it only sees `refreshed` staying false
+ * until its own stall timeout expires. Reported on every status-shaped
+ * response so a poll loop can fail fast instead of waiting that out.
+ */
+static std::string walletStatusFields(Monero::Wallet* wallet) {
+  int status = Monero::Wallet::Status_Ok;
+  std::string error;
+  // Read both under the SDK's status lock: the refresh thread can overwrite
+  // them between two separate status()/errorString() calls.
+  wallet->statusWithErrorString(status, error);
+  if (status == Monero::Wallet::Status_Ok) error.clear();
+  return "\"status\":" + std::to_string(status) + "," +
+      "\"errorString\":\"" + jsonEscape(error) + "\"";
+}
+
+/**
  * Open or create a wallet.
  * Args: documentDirectory, walletId, backend, mnemonic, password, nettype,
  *       restoreHeight, daemonAddress, tlsMode, tlsValue, proxyAddress
@@ -800,7 +818,8 @@ std::string openWallet(const std::vector<std::string> &args) {
       json += "\"balance\":\"" + std::to_string(balance) + "\",";
       json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
       json += "\"refreshed\":" +
-          std::string(entry.listener->hasRefreshed() ? "true" : "false");
+          std::string(entry.listener->hasRefreshed() ? "true" : "false") + ",";
+      json += walletStatusFields(wallet);
       json += "}";
       return json;
     }
@@ -879,7 +898,8 @@ std::string openWallet(const std::vector<std::string> &args) {
   json += "\"networkHeight\":" + std::to_string(networkHeight) + ",";
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
-  json += "\"refreshed\":false";
+  json += "\"refreshed\":false,";
+  json += walletStatusFields(wallet);
   json += "}";
 
   return json;
@@ -922,7 +942,8 @@ std::string getWalletStatus(const std::vector<std::string> &args) {
   json += "\"networkHeight\":" + std::to_string(networkHeight) + ",";
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
-  json += "\"refreshed\":" + std::string(refreshed ? "true" : "false");
+  json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
+  json += walletStatusFields(wallet);
   json += "}";
 
   return json;
@@ -1509,7 +1530,8 @@ std::string getAccountStatus(const std::vector<std::string> &args) {
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlocked) + "\",";
   json += "\"otherAccountsBalance\":\"" + std::to_string(all > balance ? all - balance : 0) + "\",";
-  json += "\"refreshed\":" + std::string(refreshed ? "true" : "false");
+  json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
+  json += walletStatusFields(wallet);
   return json + "}";
 }
 
