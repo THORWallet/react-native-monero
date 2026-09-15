@@ -1313,17 +1313,24 @@ std::string broadcastTransaction(const std::vector<std::string> &args) {
   return "success";
 }
 
-/** Helper: escape a string for JSON (escape backslash and double-quote). */
+/** Helper: escape a string for JSON, including every control byte. */
 static std::string jsonEscape(const std::string& s) {
   std::string result;
   result.reserve(s.size());
-  for (char c : s) {
+  static constexpr char hex[] = "0123456789abcdef";
+  for (unsigned char c : s) {
     if (c == '\\') result += "\\\\";
     else if (c == '"') result += "\\\"";
     else if (c == '\n') result += "\\n";
     else if (c == '\r') result += "\\r";
     else if (c == '\t') result += "\\t";
-    else result += c;
+    else if (c < 0x20) {
+      result += "\\u00";
+      result += hex[c >> 4];
+      result += hex[c & 0x0f];
+    } else {
+      result += static_cast<char>(c);
+    }
   }
   return result;
 }

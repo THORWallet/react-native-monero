@@ -156,11 +156,12 @@ inline constexpr std::size_t kMoneroCaBundleSize = sizeof(kMoneroCaBundle) - 1;
           sym =>
             sym === '_moneroMethods' ||
             sym === '_moneroMethodCount' ||
-            sym.includes('moneroSetEventCallback')
+            sym.includes('moneroSetEventCallback') ||
+            sym.includes('moneroSetWalletFilesChangedCallback')
         )
       if (keepSymbols.length === 0) {
         throw new Error(
-          'nmedit keep-list empty: expected moneroMethods / moneroMethodCount / moneroSetEventCallback'
+          'nmedit keep-list empty: expected Monero bridge callbacks and method table'
         )
       }
       const keepSymbolsPath = join(build.cwd, 'keep-symbols.txt')
