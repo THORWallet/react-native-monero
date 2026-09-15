@@ -285,7 +285,7 @@ bool WalletImpl::initWithTls(const std::string &daemon_address, uint64_t upper_t
            // react-native build: a rejected TLS handshake or unreachable daemon
            // is otherwise invisible to the bridge, which only ever sees
            // "refreshed" staying false until its own stall timeout.
-           setStatusError(tr("daemon is not connected or not synced"));
+           setStatusError(tr("wallet is not connected to daemon or daemon is not synced"));
         }`
       )
       .replace(
@@ -346,7 +346,9 @@ uint32_t WalletImpl::nextUnusedSubaddressIndex(uint32_t accountIndex) const
       !patchedWalletCpp.includes('bool WalletImpl::initWithTls') ||
       !patchedWalletCpp.includes('std::move(ssl_options)') ||
       !patchedWalletCpp.includes('bool refresh_completed = false;') ||
-      !patchedWalletCpp.includes('daemon is not connected or not synced') ||
+      !patchedWalletCpp.includes(
+        'wallet is not connected to daemon or daemon is not synced'
+      ) ||
       !patchedWalletCpp.includes(
         'refresh_completed && m_wallet2Callback->getListener()'
       )

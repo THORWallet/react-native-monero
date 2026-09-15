@@ -170,7 +170,7 @@ inline constexpr std::size_t kMoneroCaBundleSize = sizeof(kMoneroCaBundle) - 1;
         )
       ) {
         throw new Error(
-          'nmedit keep-list incomplete: expected moneroMethods / moneroMethodCount / moneroSetEventCallback / moneroSetWalletFilesChangedCallback'
+          'nmedit keep-list incomplete: expected Monero bridge callbacks and method table'
         )
       }
       const keepSymbolsPath = join(build.cwd, 'keep-symbols.txt')
