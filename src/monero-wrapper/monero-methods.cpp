@@ -44,6 +44,26 @@ static std::string jsonEscape(const std::string& s);
 static std::mutex g_eventCbMutex;
 static WalletEventCallback g_walletEventCallback;
 
+/** Global wallet-files-written callback (thread-safe). */
+static std::mutex g_filesCbMutex;
+static WalletFilesChangedCallback g_walletFilesChangedCallback;
+
+void moneroSetWalletFilesChangedCallback(WalletFilesChangedCallback cb) {
+  std::lock_guard<std::mutex> lock(g_filesCbMutex);
+  g_walletFilesChangedCallback = cb;
+}
+
+static void notifyWalletFilesChanged(const std::string& walletId) {
+  std::lock_guard<std::mutex> lock(g_filesCbMutex);
+  if (!g_walletFilesChangedCallback) return;
+  // Bookkeeping only: a platform failure here must not abort a store on the
+  // refresh thread or fail an otherwise-successful open.
+  try {
+    g_walletFilesChangedCallback(walletId);
+  } catch (...) {
+  }
+}
+
 void moneroSetEventCallback(WalletEventCallback cb) {
   {
     std::lock_guard<std::mutex> lock(g_eventCbMutex);
@@ -139,6 +159,7 @@ public:
       try {
         m_wallet->store("");
         m_lastSaveHeight = height;
+        notifyWalletFilesChanged(m_walletId);
       } catch (...) {
         // Ignore store errors during sync - will retry on next interval
       }
@@ -160,6 +181,7 @@ public:
     try {
       m_wallet->store("");
       m_lastSaveHeight = m_wallet->blockChainHeight();
+      notifyWalletFilesChanged(m_walletId);
     } catch (...) {
       // Ignore store errors - will retry on next refresh
     }
@@ -294,8 +316,11 @@ static void closeWalletEntry(
   entry.wallet->setListener(nullptr);
   disposeRetainedTxs(entry.walletId, entry.wallet);
   Monero::WalletManager* manager = getWalletManager(entry.backend);
+  const std::string walletId = entry.walletId;
   const bool closed = manager->closeWallet(entry.wallet);
   g_wallets.erase(it);
+  // closeWallet stores by default, so the cache file on disk is a new one.
+  notifyWalletFilesChanged(walletId);
   if (!closed) throw std::runtime_error("Failed to close wallet");
 }
 
@@ -892,6 +917,7 @@ std::string openWallet(const std::vector<std::string> &args) {
   entry.cachedBalance = balance;
   entry.cachedUnlockedBalance = unlockedBalance;
   g_wallets[walletId] = std::move(entry);
+  notifyWalletFilesChanged(walletId);
 
   std::string json = "{";
   json += "\"syncedHeight\":" + std::to_string(syncedHeight) + ",";
@@ -1509,6 +1535,7 @@ std::string createAccount(const std::vector<std::string> &args) {
   Monero::Wallet* wallet = findWalletOrThrow(args[0]).wallet;
   wallet->addSubaddressAccount(args[1]);
   wallet->store("");
+  notifyWalletFilesChanged(args[0]);
   return "{\"index\":" + std::to_string(wallet->numSubaddressAccounts() - 1) + "}";
 }
 

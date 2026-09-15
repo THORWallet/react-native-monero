@@ -22,4 +22,13 @@ using WalletEventCallback = std::function<void(
 // Thread-safe: the callback is guarded by a mutex.
 void moneroSetEventCallback(WalletEventCallback cb);
 
+// Callback type for "the files of this wallet were just written" (walletId).
+using WalletFilesChangedCallback = std::function<void(const std::string&)>;
+
+// Set the global callback invoked after an open, close, or store has written
+// the wallet files. iOS uses it to re-apply the iCloud backup exclusion, which
+// wallet2's write-then-rename store drops. Thread-safe, and fires on the SDK
+// refresh thread for the periodic stores during sync.
+void moneroSetWalletFilesChangedCallback(WalletFilesChangedCallback cb);
+
 #endif

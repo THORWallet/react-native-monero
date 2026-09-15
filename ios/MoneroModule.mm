@@ -14,6 +14,39 @@ static bool isNymCompletionMethod(const std::string& method) {
 // Global pointer so the C++ callback can reach the ObjC module instance
 static __weak MoneroModule* g_module = nil;
 
+// The wallet files (the wallet2 cache with transaction history and key images,
+// plus .keys) live in Documents, which iOS backs up to iCloud by default. They
+// are named "<backend>_<walletId>" with .keys/.address.txt siblings, so the id
+// sits mid-name and has to be matched by containment. Re-applied on every write
+// because store() renames a fresh, unflagged file into place.
+static void excludeWalletFilesFromBackup(const std::string& walletId) {
+  if (walletId.empty()) return;
+  NSString *needle = [NSString stringWithUTF8String:walletId.c_str()];
+  if (needle == nil || needle.length == 0) return;
+
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSURL *docsDir = [fm URLForDirectory:NSDocumentDirectory
+                             inDomain:NSUserDomainMask
+                    appropriateForURL:nil
+                               create:NO
+                                error:nil];
+  if (docsDir == nil) return;
+
+  NSArray<NSURL *> *items =
+    [fm contentsOfDirectoryAtURL:docsDir
+     includingPropertiesForKeys:nil
+                        options:NSDirectoryEnumerationSkipsSubdirectoryDescendants
+                          error:nil];
+  for (NSURL *item in items) {
+    if ([[item lastPathComponent] rangeOfString:needle].location == NSNotFound) {
+      continue;
+    }
+    [item setResourceValue:@YES
+                    forKey:NSURLIsExcludedFromBackupKey
+                     error:nil];
+  }
+}
+
 @implementation MoneroModule
 
 RCT_EXPORT_MODULE(MoneroLwsfModule);
@@ -47,6 +80,13 @@ RCT_EXPORT_MODULE(MoneroLwsfModule);
           @"data":      nsPayload
         }];
       });
+    });
+
+    // Keep the wallet cache and keys out of iCloud backups. Fires on the SDK
+    // refresh thread for the periodic stores during sync, which is fine:
+    // NSFileManager and setResourceValue: are thread-safe.
+    moneroSetWalletFilesChangedCallback([](const std::string& walletId) {
+      excludeWalletFilesFromBackup(walletId);
     });
   }
   return self;
