@@ -653,12 +653,16 @@ export const lwsf = defineLib({
   // Bump this whenever the rpc.cpp / config patch below changes, or the build
   // silently reuses the cached (unpatched) library. The literal tag does not
   // hash the patch content, so edits here are invisible to the cache otherwise.
-  cacheTag: '3-nym-timeout-next-subaddress-tls-policy-v2',
+  cacheTag: '4-da8e261-txcap-nym-timeout-next-subaddress-tls-policy-v2',
   libDeps: ['boost', 'libsodium', 'libunbound', 'libzmq', 'openssl'],
   deps: ['monero.clone'],
 
   url: 'https://github.com/vtnerd/lwsf.git',
-  hash: 'cedb2164f9ccd418b91a4e54ee8479c8d5c3cad0', // Nov 7, 2025
+  // Dec 13, 2025. Includes upstream da8e261 "Update get_address_txs tx array
+  // constraint": the old pin rejected any get_address_txs response with more
+  // than config::max_txes_in_rpc = 2048 transactions, permanently bricking
+  // sync for wallets whose (decoy-inflated) tx list crossed that size.
+  hash: 'da8e2617958312f10fe4406808c2a951c5cf0a09',
 
   async build(build, platform, prefixPath) {
     // Patch rpc.cpp to support api_key injection in HTTP requests
@@ -666,13 +670,11 @@ export const lwsf = defineLib({
     // (used for Nym mixnet support).
     const rpcPath = join(build.cwd, 'src/rpc.cpp')
     const rpcCpp = await readFile(rpcPath, 'utf8')
-    await writeFile(
-      rpcPath,
-      rpcCpp
-        // Add api_key storage + nym-fetch declarations after includes.
-        .replace(
-          '#include "wire/wrappers_impl.h"',
-          `#include "wire/wrappers_impl.h"
+    const patchedRpcCpp = rpcCpp
+      // Add api_key storage + nym-fetch declarations after includes.
+      .replace(
+        '#include "wire/wrappers_impl.h"',
+        `#include "wire/wrappers_impl.h"
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -699,24 +701,44 @@ namespace nymfetch {
       const std::string& body,
       std::uint64_t timeoutMs);
 }`
-        )
-        // Modify invoke_payload to (1) inject api_key into JSON body and
-        // (2) redirect to the JS fetch bridge when Nym is enabled.
-        .replace(
-          `expect<std::string> invoke_payload(http_client& client, const boost::string_ref endpoint, const epee::byte_slice payload)
+      )
+      // Modify invoke_payload to (1) inject api_key into JSON body and
+      // (2) redirect to the JS fetch bridge when Nym is enabled.
+      .replace(
+        `expect<std::string> invoke_payload(http_client& client, const boost::string_ref prefix, boost::string_ref endpoint, const epee::byte_slice payload)
   {
     static const epee::net_utils::http::fields_list headers{
       {"Content-Type", "application/json; charset=utf-8"}
     };
 
+    if (!client.is_connected())
+    {
+      if (!client.connect(config::connect_timeout))
+        return {error::no_response};
+    }
+
+    std::string real;
+    if (!prefix.empty())
+    {
+      real = std::string{prefix} + std::string{endpoint};
+      endpoint = real;
+    }
+
     const epee::net_utils::http::http_response_info* response = nullptr;
     if (!client.invoke(endpoint, "POST", {reinterpret_cast<const char*>(payload.data()), payload.size()}, config::rpc_timeout, std::addressof(response), headers))
       return {error::no_response};`,
-          `expect<std::string> invoke_payload(http_client& client, const boost::string_ref endpoint, epee::byte_slice payload)
+        `expect<std::string> invoke_payload(http_client& client, const boost::string_ref prefix, boost::string_ref endpoint, const epee::byte_slice payload)
   {
     static const epee::net_utils::http::fields_list headers{
       {"Content-Type", "application/json; charset=utf-8"}
     };
+
+    std::string real;
+    if (!prefix.empty())
+    {
+      real = std::string{prefix} + std::string{endpoint};
+      endpoint = real;
+    }
 
     // Inject api_key if set (added by react-native build)
     std::string body_str;
@@ -737,7 +759,9 @@ namespace nymfetch {
 
     // Nym path: delegate to JS fetch bridge instead of hitting the network
     // directly. The JS layer is responsible for actually executing the
-    // request through mixFetch.
+    // request through mixFetch. This must run before the socket connect
+    // below: a Nym wallet must never open a direct TCP connection to the
+    // daemon.
     if (nymfetch::isEnabled()) {
       const std::string base = nymfetch::getBaseUrl();
       if (base.empty()) return {error::no_response};
@@ -745,10 +769,10 @@ namespace nymfetch {
       if (path.empty() || path.front() != '/') path.insert(path.begin(), '/');
       const std::string url = base + path;
       try {
-        // Nym mixnet round-trips routinely exceed the 5s config::rpc_timeout
+        // Nym mixnet round-trips routinely exceed the config::rpc_timeout
         // used for the direct client below (the mixFetch client itself allows
         // 300s). A single-shot spend RPC (get_random_outs, submit_raw_tx) has
-        // no retry, so a 5s budget makes LWS sends over Nym fail deterministically
+        // no retry, so a short budget makes LWS sends over Nym fail deterministically
         // while the retrying sync loop merely limps. Give the Nym path a generous
         // budget instead.
         const std::uint64_t nymTimeoutMs = 120000;
@@ -766,12 +790,27 @@ namespace nymfetch {
       }
     }
 
+    if (!client.is_connected())
+    {
+      if (!client.connect(config::connect_timeout))
+        return {error::no_response};
+    }
+
     const epee::net_utils::http::http_response_info* response = nullptr;
     if (!client.invoke(endpoint, "POST", body_str, config::rpc_timeout, std::addressof(response), headers))
       return {error::no_response};`
-        ),
-      'utf8'
-    )
+      )
+    // Anchored replaces silently no-op when upstream drifts; fail the build
+    // instead of shipping an unpatched (no api_key, no Nym) client.
+    if (
+      !patchedRpcCpp.includes('void set_api_key') ||
+      !patchedRpcCpp.includes('client.invoke(endpoint, "POST", body_str')
+    ) {
+      throw new Error(
+        'lwsf rpc.cpp patch anchors did not match the pinned source'
+      )
+    }
+    await writeFile(rpcPath, patchedRpcCpp, 'utf8')
     build.log('Patched rpc.cpp for api_key and nym-fetch support')
 
     // A refresh callback means server data was merged successfully. Upstream
@@ -827,8 +866,6 @@ namespace nymfetch {
       epee::net_utils::http::url_content url{};
       if (!epee::net_utils::parse_url(daemon_address, url))
         throw std::runtime_error{"Invalid LWS URL: " + daemon_address};
-      if (!url.m_uri_content.m_path.empty())
-        throw std::runtime_error{"LWS URL contains path (unsupported)"};
 
       if (!proxy_address.empty() && !setProxy(proxy_address))
         return false;
@@ -853,7 +890,31 @@ namespace nymfetch {
         else
           url.port = 80;
       }
+
+      // Configure SSL certificate verification
+      if (options.support != epee::net_utils::ssl_support_t::e_ssl_support_disabled)
+      {
+        bool ca_file_valid = !ca_file_path_.empty() && std::filesystem::exists(ca_file_path_);
+        
+        if (ca_file_valid) {
+          try {
+            options = epee::net_utils::ssl_options_t(
+              std::vector<std::vector<std::uint8_t>>{},
+              ca_file_path_
+            );
+            options.verification = epee::net_utils::ssl_verification_t::user_ca;
+          } catch (const std::exception& e) {
+            options.verification = epee::net_utils::ssl_verification_t::system_ca;
+          }
+        } else {
+          options.verification = epee::net_utils::ssl_verification_t::system_ca;
+        }
+      }
+
+      const boost::unique_lock<boost::mutex> lock{data_->sync};
       data_->client.set_server(std::move(url.host), std::to_string(url.port), std::move(login), std::move(options));
+      data_->passed_login = false;
+      data_->client_prefix = std::move(url.uri);
     }
     catch (const std::exception& e)
     {
@@ -889,8 +950,6 @@ namespace nymfetch {
       epee::net_utils::http::url_content url{};
       if (!epee::net_utils::parse_url(daemon_address, url))
         throw std::runtime_error{"Invalid LWS URL: " + daemon_address};
-      if (!url.m_uri_content.m_path.empty())
-        throw std::runtime_error{"LWS URL contains path (unsupported)"};
       if (!proxy_address.empty() && !setProxy(proxy_address))
         return false;
       boost::optional<epee::net_utils::http::login> login;
@@ -898,8 +957,14 @@ namespace nymfetch {
         login.emplace(daemon_username, daemon_password);
       if (!url.port)
         url.port = options.support == epee::net_utils::ssl_support_t::e_ssl_support_disabled ? 80 : 443;
+      // The caller's ssl_options already carry the exact per-node policy
+      // (bundled CA, custom CA, pinned certificate, fingerprint, or none), so
+      // upstream's ca_file_path_ override is deliberately not applied here.
+      const boost::unique_lock<boost::mutex> lock{data_->sync};
       data_->client.set_server(std::move(url.host), std::to_string(url.port),
                                std::move(login), std::move(options));
+      data_->passed_login = false;
+      data_->client_prefix = std::move(url.uri);
     }
     catch (const std::exception& e)
     {
