@@ -159,9 +159,18 @@ inline constexpr std::size_t kMoneroCaBundleSize = sizeof(kMoneroCaBundle) - 1;
             sym.includes('moneroSetEventCallback') ||
             sym.includes('moneroSetWalletFilesChangedCallback')
         )
-      if (keepSymbols.length === 0) {
+      // Every symbol MoneroModule.mm links against must survive the nmedit
+      // localization, so count the distinct keep patterns, not just any hit:
+      // 0.4.1-thorwallet.4 shipped with moneroSetWalletFilesChangedCallback
+      // localized and every iOS app build died at link time.
+      if (
+        keepSymbols.length === 0 ||
+        !keepSymbols.some(sym =>
+          sym.includes('moneroSetWalletFilesChangedCallback')
+        )
+      ) {
         throw new Error(
-          'nmedit keep-list empty: expected Monero bridge callbacks and method table'
+          'nmedit keep-list incomplete: expected Monero bridge callbacks and method table'
         )
       }
       const keepSymbolsPath = join(build.cwd, 'keep-symbols.txt')
