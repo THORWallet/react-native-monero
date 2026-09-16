@@ -96,6 +96,8 @@ export interface WalletStatus {
    * fail over to another node instead of waiting for its own timeout.
    */
   errorString: string
+  /** Stable native classification; absent on binaries predating status codes. */
+  errorCode?: 'DAEMON_SERVICE_FAULT' | 'TLS_IDENTITY'
 }
 
 /** Wallet status scoped to one subaddress account. */

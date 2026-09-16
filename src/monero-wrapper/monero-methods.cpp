@@ -205,6 +205,7 @@ struct WalletEntry {
   std::string path;
   std::string walletId;
   std::string connectionKey;
+  std::shared_ptr<std::atomic<bool>> tlsIdentityRejected;
   
   uint64_t cachedSyncedHeight = 0;
   uint64_t cachedBalance = 0;
@@ -468,10 +469,12 @@ struct DaemonConnection {
   std::string address;
   std::string proxyAddress;
   std::string key;
+  std::shared_ptr<std::atomic<bool>> tlsIdentityRejected;
   epee::net_utils::ssl_options_t sslOptions;
 
   DaemonConnection()
-      : sslOptions(epee::net_utils::ssl_support_t::e_ssl_support_disabled) {}
+      : tlsIdentityRejected(std::make_shared<std::atomic<bool>>(false)),
+        sslOptions(epee::net_utils::ssl_support_t::e_ssl_support_disabled) {}
 };
 
 static DaemonConnection makeDaemonConnection(
@@ -556,6 +559,17 @@ static DaemonConnection makeDaemonConnection(
     out.sslOptions.verification = epee::net_utils::ssl_verification_t::none;
   } else {
     throw std::runtime_error("Unsupported TLS mode: " + mode);
+  }
+  if (https &&
+      out.sslOptions.verification !=
+          epee::net_utils::ssl_verification_t::none) {
+    const auto tlsIdentityRejected = out.tlsIdentityRejected;
+    out.sslOptions.peer_verification_failure_callback =
+        [tlsIdentityRejected]() { tlsIdentityRejected->store(true); };
+    out.sslOptions.peer_fingerprint_callback =
+        [tlsIdentityRejected](const std::string&) {
+          tlsIdentityRejected->store(false);
+        };
   }
   out.key = out.address + "\n" + mode + "\n" + sha256Hex(value) +
       "\n" + out.proxyAddress;
@@ -783,15 +797,24 @@ std::string isValidAddress(const std::vector<std::string> &args) {
  * until its own stall timeout expires. Reported on every status-shaped
  * response so a poll loop can fail fast instead of waiting that out.
  */
-static std::string walletStatusFields(Monero::Wallet* wallet) {
+static std::string walletStatusFields(
+    Monero::Wallet* wallet,
+    const std::shared_ptr<std::atomic<bool>>& tlsIdentityRejected) {
   int status = Monero::Wallet::Status_Ok;
   std::string error;
   // Read both under the SDK's status lock: the refresh thread can overwrite
   // them between two separate status()/errorString() calls.
   wallet->statusWithErrorString(status, error);
   if (status == Monero::Wallet::Status_Ok) error.clear();
+  const std::string errorCode =
+      status == Monero::Wallet::Status_Ok
+          ? std::string()
+          : tlsIdentityRejected && tlsIdentityRejected->load()
+              ? "TLS_IDENTITY"
+              : "DAEMON_SERVICE_FAULT";
   return "\"status\":" + std::to_string(status) + "," +
-      "\"errorString\":\"" + jsonEscape(error) + "\"";
+      "\"errorString\":\"" + jsonEscape(error) + "\"," +
+      "\"errorCode\":\"" + errorCode + "\"";
 }
 
 /**
@@ -844,7 +867,7 @@ std::string openWallet(const std::vector<std::string> &args) {
       json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
       json += "\"refreshed\":" +
           std::string(entry.listener->hasRefreshed() ? "true" : "false") + ",";
-      json += walletStatusFields(wallet);
+      json += walletStatusFields(wallet, entry.tlsIdentityRejected);
       json += "}";
       return json;
     }
@@ -913,6 +936,7 @@ std::string openWallet(const std::vector<std::string> &args) {
   entry.path = path;
   entry.walletId = walletId;
   entry.connectionKey = connection.key;
+  entry.tlsIdentityRejected = connection.tlsIdentityRejected;
   entry.cachedSyncedHeight = syncedHeight;
   entry.cachedBalance = balance;
   entry.cachedUnlockedBalance = unlockedBalance;
@@ -925,7 +949,7 @@ std::string openWallet(const std::vector<std::string> &args) {
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
   json += "\"refreshed\":false,";
-  json += walletStatusFields(wallet);
+  json += walletStatusFields(wallet, connection.tlsIdentityRejected);
   json += "}";
 
   return json;
@@ -969,7 +993,7 @@ std::string getWalletStatus(const std::vector<std::string> &args) {
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
   json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
-  json += walletStatusFields(wallet);
+  json += walletStatusFields(wallet, entry.tlsIdentityRejected);
   json += "}";
 
   return json;
@@ -1565,7 +1589,7 @@ std::string getAccountStatus(const std::vector<std::string> &args) {
   json += "\"unlockedBalance\":\"" + std::to_string(unlocked) + "\",";
   json += "\"otherAccountsBalance\":\"" + std::to_string(all > balance ? all - balance : 0) + "\",";
   json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
-  json += walletStatusFields(wallet);
+  json += walletStatusFields(wallet, entry.tlsIdentityRejected);
   return json + "}";
 }
 

@@ -10,7 +10,7 @@ const moneroHash = '38bc62741b82cca179fb8e3437a388b0e0f67842' // Nov 7, 2025
 
 addTask({
   name: 'monero.clone',
-  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v2`,
+  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v3`,
   async run(build) {
     await getRepo(
       'monero',
@@ -58,9 +58,9 @@ addTask({
       'utf8'
     )
 
-    // Extend epee SSL options with an observation callback for explicit TOFU
-    // discovery, and allow an explicit CA file while retaining system_ca's
-    // hostname verification.
+    // Extend epee SSL options with callbacks for explicit TOFU discovery and
+    // certificate-rejection classification, and allow an explicit CA file
+    // while retaining system_ca's hostname verification.
     const netSslHeaderPath = join(
       build.basePath,
       'monero/contrib/epee/include/net/net_ssl.h'
@@ -75,9 +75,13 @@ addTask({
       .replace(
         '    ssl_verification_t verification;',
         `    ssl_verification_t verification;
-    std::function<void(const std::string&)> peer_fingerprint_callback;`
+    std::function<void(const std::string&)> peer_fingerprint_callback;
+    std::function<void()> peer_verification_failure_callback;`
       )
-    if (!patchedNetSslHeader.includes('peer_fingerprint_callback')) {
+    if (
+      !patchedNetSslHeader.includes('peer_fingerprint_callback') ||
+      !patchedNetSslHeader.includes('peer_verification_failure_callback')
+    ) {
       throw new Error('Monero net_ssl.h observer patch anchor did not match')
     }
     await writeFile(netSslHeaderPath, patchedNetSslHeader, 'utf8')
@@ -134,10 +138,21 @@ addTask({
           verification != ssl_verification_t::user_ca) ||
          host.empty() || MONERO_HOSTNAME_VERIFY(host)(preverified, ctx))`
       )
+      .replace(
+        `          MERROR("SSL certificate is not in the allowed list, connection dropped");
+          return false;`,
+        `          MERROR("SSL certificate is not in the allowed list, connection dropped");
+          if (peer_verification_failure_callback)
+            peer_verification_failure_callback();
+          return false;`
+      )
     if (
       !patchedNetSslCpp.includes('SSL_get1_peer_certificate') ||
       !patchedNetSslCpp.includes('Failed to load CA file at') ||
-      !patchedNetSslCpp.includes('verification != ssl_verification_t::user_ca')
+      !patchedNetSslCpp.includes(
+        'verification != ssl_verification_t::user_ca'
+      ) ||
+      !patchedNetSslCpp.includes('peer_verification_failure_callback()')
     ) {
       throw new Error('Monero net_ssl.cpp TLS patch anchor did not match')
     }
