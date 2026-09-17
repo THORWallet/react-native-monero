@@ -1,6 +1,6 @@
 {
   "name": "@thorwallet/react-native-monero",
-  "version": "0.4.1-thorwallet.5",
+  "version": "0.4.1-thorwallet.6",
   "description": "React Native bindings for the monero-lwsf library",
   "homepage": "https://github.com/THORWallet/react-native-monero",
   "repository": {

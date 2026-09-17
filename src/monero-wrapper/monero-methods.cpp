@@ -205,7 +205,6 @@ struct WalletEntry {
   std::string path;
   std::string walletId;
   std::string connectionKey;
-  std::shared_ptr<std::atomic<bool>> tlsIdentityRejected;
   
   uint64_t cachedSyncedHeight = 0;
   uint64_t cachedBalance = 0;
@@ -469,12 +468,10 @@ struct DaemonConnection {
   std::string address;
   std::string proxyAddress;
   std::string key;
-  std::shared_ptr<std::atomic<bool>> tlsIdentityRejected;
   epee::net_utils::ssl_options_t sslOptions;
 
   DaemonConnection()
-      : tlsIdentityRejected(std::make_shared<std::atomic<bool>>(false)),
-        sslOptions(epee::net_utils::ssl_support_t::e_ssl_support_disabled) {}
+      : sslOptions(epee::net_utils::ssl_support_t::e_ssl_support_disabled) {}
 };
 
 static DaemonConnection makeDaemonConnection(
@@ -559,17 +556,6 @@ static DaemonConnection makeDaemonConnection(
     out.sslOptions.verification = epee::net_utils::ssl_verification_t::none;
   } else {
     throw std::runtime_error("Unsupported TLS mode: " + mode);
-  }
-  if (https &&
-      out.sslOptions.verification !=
-          epee::net_utils::ssl_verification_t::none) {
-    const auto tlsIdentityRejected = out.tlsIdentityRejected;
-    out.sslOptions.peer_verification_failure_callback =
-        [tlsIdentityRejected]() { tlsIdentityRejected->store(true); };
-    out.sslOptions.peer_fingerprint_callback =
-        [tlsIdentityRejected](const std::string&) {
-          tlsIdentityRejected->store(false);
-        };
   }
   out.key = out.address + "\n" + mode + "\n" + sha256Hex(value) +
       "\n" + out.proxyAddress;
@@ -791,30 +777,79 @@ std::string isValidAddress(const std::vector<std::string> &args) {
 }
 
 /**
+ * Structured classification of wallet2's last error text.
+ *
+ * The text is not a stable API: it comes from epee/boost.asio and has been
+ * reworded across forks, so every consumer that greps it re-derives the same
+ * fragile regex and silently loses coverage on the next rewording. Emit a code
+ * alongside the text and let the text stay human-readable. An empty code means
+ * "not classified" - callers keep whatever fallback they already have.
+ */
+static std::string walletErrorCode(int status, const std::string& error) {
+  if (status == Monero::Wallet::Status_Ok || error.empty()) return "";
+  const std::string lower = lowerAscii(error);
+
+  // epee logs this, then reconnects without SSL and the connection recovers,
+  // so it is NOT an identity rejection. It must be tested before the generic
+  // handshake failure below, whose text it contains.
+  if (lower.find("reconnecting without ssl") != std::string::npos) {
+    return "";
+  }
+
+  // A pinned fingerprint or CA the peer did not satisfy, plus OpenSSL's own
+  // verification failures. Every one of these happens AFTER the TCP connect
+  // succeeded, so a node that is simply down cannot produce them.
+  if (lower.find("certificate is not in the allowed list") != std::string::npos ||
+      lower.find("ssl handshake failed") != std::string::npos ||
+      lower.find("certificate verify failed") != std::string::npos ||
+      lower.find("certificate verification failed") != std::string::npos) {
+    return "TLS_IDENTITY";
+  }
+
+  // The daemon is unreachable, busy, or RPC-restricted: a different node can
+  // help, and waiting might too. A TLS identity failure is neither.
+  if (lower.find("no connection to daemon") != std::string::npos ||
+      lower.find("not connected to daemon") != std::string::npos ||
+      lower.find("daemon is not connected") != std::string::npos ||
+      lower.find("daemon is busy") != std::string::npos ||
+      lower.find("core is busy") != std::string::npos ||
+      lower.find("from daemon") != std::string::npos ||
+      lower.find("failed to get blockchain height") != std::string::npos ||
+      lower.find("failed to get height") != std::string::npos ||
+      lower.find("failed to get blocks") != std::string::npos ||
+      lower.find("failed to get hashes") != std::string::npos ||
+      lower.find("failed to get outs") != std::string::npos ||
+      lower.find("failed to get random outs") != std::string::npos ||
+      lower.find("failed to get outputs to mix") != std::string::npos ||
+      lower.find("failed to get output distribution") != std::string::npos ||
+      lower.find("failed to get output histogram") != std::string::npos ||
+      lower.find("method not found") != std::string::npos ||
+      lower.find("access denied") != std::string::npos) {
+    return "DAEMON_SERVICE_FAULT";
+  }
+
+  return "";
+}
+
+/**
  * JSON fields carrying the wallet's last backend error. A rejected TLS
  * handshake or an unreachable daemon makes the SDK skip its refresh, which is
  * otherwise invisible to the caller: it only sees `refreshed` staying false
  * until its own stall timeout expires. Reported on every status-shaped
  * response so a poll loop can fail fast instead of waiting that out.
  */
-static std::string walletStatusFields(
-    Monero::Wallet* wallet,
-    const std::shared_ptr<std::atomic<bool>>& tlsIdentityRejected) {
+static std::string walletStatusFields(Monero::Wallet* wallet) {
   int status = Monero::Wallet::Status_Ok;
   std::string error;
   // Read both under the SDK's status lock: the refresh thread can overwrite
   // them between two separate status()/errorString() calls.
   wallet->statusWithErrorString(status, error);
   if (status == Monero::Wallet::Status_Ok) error.clear();
-  const std::string errorCode =
-      status == Monero::Wallet::Status_Ok
-          ? std::string()
-          : tlsIdentityRejected && tlsIdentityRejected->load()
-              ? "TLS_IDENTITY"
-              : "DAEMON_SERVICE_FAULT";
+  // walletErrorCode returns one of a fixed set of literals, so it needs no
+  // escaping; errorString is caller-influenced and still does.
   return "\"status\":" + std::to_string(status) + "," +
       "\"errorString\":\"" + jsonEscape(error) + "\"," +
-      "\"errorCode\":\"" + errorCode + "\"";
+      "\"errorCode\":\"" + walletErrorCode(status, error) + "\"";
 }
 
 /**
@@ -867,7 +902,7 @@ std::string openWallet(const std::vector<std::string> &args) {
       json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
       json += "\"refreshed\":" +
           std::string(entry.listener->hasRefreshed() ? "true" : "false") + ",";
-      json += walletStatusFields(wallet, entry.tlsIdentityRejected);
+      json += walletStatusFields(wallet);
       json += "}";
       return json;
     }
@@ -936,7 +971,6 @@ std::string openWallet(const std::vector<std::string> &args) {
   entry.path = path;
   entry.walletId = walletId;
   entry.connectionKey = connection.key;
-  entry.tlsIdentityRejected = connection.tlsIdentityRejected;
   entry.cachedSyncedHeight = syncedHeight;
   entry.cachedBalance = balance;
   entry.cachedUnlockedBalance = unlockedBalance;
@@ -949,7 +983,7 @@ std::string openWallet(const std::vector<std::string> &args) {
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
   json += "\"refreshed\":false,";
-  json += walletStatusFields(wallet, connection.tlsIdentityRejected);
+  json += walletStatusFields(wallet);
   json += "}";
 
   return json;
@@ -993,7 +1027,7 @@ std::string getWalletStatus(const std::vector<std::string> &args) {
   json += "\"balance\":\"" + std::to_string(balance) + "\",";
   json += "\"unlockedBalance\":\"" + std::to_string(unlockedBalance) + "\",";
   json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
-  json += walletStatusFields(wallet, entry.tlsIdentityRejected);
+  json += walletStatusFields(wallet);
   json += "}";
 
   return json;
@@ -1589,7 +1623,7 @@ std::string getAccountStatus(const std::vector<std::string> &args) {
   json += "\"unlockedBalance\":\"" + std::to_string(unlocked) + "\",";
   json += "\"otherAccountsBalance\":\"" + std::to_string(all > balance ? all - balance : 0) + "\",";
   json += "\"refreshed\":" + std::string(refreshed ? "true" : "false") + ",";
-  json += walletStatusFields(wallet, entry.tlsIdentityRejected);
+  json += walletStatusFields(wallet);
   return json + "}";
 }
 

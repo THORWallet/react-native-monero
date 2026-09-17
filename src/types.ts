@@ -74,6 +74,15 @@ export interface MoneroAccountSummary {
   unlockedBalance: string
 }
 
+/**
+ * Stable classification of `WalletStatus.errorString`. Empty when the status is
+ * ok, or when the text could not be classified; prefer it over matching the
+ * text, which comes from epee/boost.asio and is not a stable API.
+ * - `TLS_IDENTITY`         the peer's certificate or pinned fingerprint was rejected
+ * - `DAEMON_SERVICE_FAULT` the daemon is unreachable, busy, or RPC-restricted
+ */
+export type WalletErrorCode = '' | 'TLS_IDENTITY' | 'DAEMON_SERVICE_FAULT'
+
 /** Return type for openWallet and getWalletStatus. */
 export interface WalletStatus {
   syncedHeight: number
@@ -96,8 +105,8 @@ export interface WalletStatus {
    * fail over to another node instead of waiting for its own timeout.
    */
   errorString: string
-  /** Stable native classification; absent on binaries predating status codes. */
-  errorCode?: 'DAEMON_SERVICE_FAULT' | 'TLS_IDENTITY'
+  /** Classification of `errorString`; see {@link WalletErrorCode}. */
+  errorCode: WalletErrorCode
 }
 
 /** Wallet status scoped to one subaddress account. */
