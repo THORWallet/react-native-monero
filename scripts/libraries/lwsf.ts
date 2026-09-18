@@ -10,7 +10,7 @@ const moneroHash = '38bc62741b82cca179fb8e3437a388b0e0f67842' // Nov 7, 2025
 
 addTask({
   name: 'monero.clone',
-  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v2`,
+  cacheTag: `${moneroHash}-next-subaddress-v2-verified-tls-v3`,
   async run(build) {
     await getRepo(
       'monero',
